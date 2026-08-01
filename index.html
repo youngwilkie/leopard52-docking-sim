@@ -133,6 +133,15 @@
     background:rgba(255,255,255,.06);color:var(--ink);font-weight:700;font-size:13px;cursor:pointer}
   #resBtns button.p{background:var(--acc);color:#04121c;border-color:var(--acc)}
 
+  /* In the helm view the real 3-D wheel occupies the bottom-centre, so the
+     on-screen wheel graphic is redundant and the console has to move aside. */
+  body.helmcam #wheelWrap{display:none}
+  body.helmcam #ctl{left:12px;transform:none;bottom:12px;padding:8px 10px}
+  body.helmcam #ctl .lever{width:50px}
+  body.helmcam #ctl .leverTrack{height:118px}
+  body.helmcam #calls{bottom:auto;top:212px;width:210px}
+  body.mobile.helmcam #mission{left:132px;transform:none;max-width:150px}
+
   #cams{position:absolute;top:12px;right:220px;display:flex;gap:5px}
   #cams button{pointer-events:auto;background:var(--panel);border:1px solid var(--edge);color:var(--dim);
     border-radius:8px;padding:5px 9px;font-size:10px;font-weight:700;letter-spacing:.06em;cursor:pointer}
@@ -1516,11 +1525,67 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       const sr = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.62, 5.4), white);
       sr.position.set(s * 3.05, 3.95, 0.5); g.add(sr);
     }
-    const con = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.72, 0.62), grey);
-    con.position.set(2.05, 4.05, -1.5); g.add(con);
-    const mfd = win(1.1, 0.42, 0.05); mfd.position.set(2.05, 4.26, -1.8); mfd.rotation.x = 0.3; g.add(mfd);
-    const wheel = new THREE.Mesh(new THREE.TorusGeometry(0.28, 0.032, 8, 20), dark);
-    wheel.position.set(2.05, 4.4, -1.15); wheel.rotation.x = 1.15; g.add(wheel);
+    /* ---- helm station: destroyer wheel on a pedestal, starboard side -----
+       Geometry is chosen so the helm camera (eye at 2.05, 5.15, -0.90) frames
+       the top ~40 % of the wheel across the bottom of the view: the wheel sits
+       0.83 m forward of and 0.58 m below the eye, so its top rim lands about
+       70 % down the frame and the screen edge cuts it just below that.     */
+    const steel = new THREE.MeshPhongMaterial({ color: 0xc2cace, shininess: 120, specular: 0x8899a0 });
+    const leather = new THREE.MeshPhongMaterial({ color: 0x2a2724, shininess: 22 });
+    const kingMat = new THREE.MeshPhongMaterial({ color: 0xc4452f, shininess: 60 });
+
+    const con = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.66, 0.46), grey);
+    con.position.set(2.05, 4.02, -2.15); g.add(con);
+    const mfd = win(1.25, 0.40, 0.05); mfd.position.set(2.05, 4.37, -2.12);
+    mfd.rotation.x = 0.42; g.add(mfd);
+    const throt = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.06, 0.3), dark);
+    throt.position.set(1.15, 4.37, -2.0); g.add(throt);
+    for (const dx of [-0.05, 0.05]) {
+      const lv = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.018, 0.24, 6), steel);
+      lv.position.set(1.15 + dx, 4.47, -2.0); lv.rotation.x = -0.25; g.add(lv);
+    }
+
+    const ped = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.115, 0.95, 12), steel);
+    ped.position.set(2.05, 4.10, -1.73); g.add(ped);
+
+    const wheelTilt = new THREE.Group();
+    wheelTilt.position.set(2.05, 4.57, -1.73);
+    wheelTilt.rotation.x = -0.28;                 // top raked forward, as fitted
+    g.add(wheelTilt);
+    const wheel = new THREE.Group();              // this is what actually spins
+    wheelTilt.add(wheel);
+
+    const R = 0.38;
+    wheel.add(new THREE.Mesh(new THREE.TorusGeometry(R, 0.021, 10, 44), leather));
+    const hubO = new THREE.Mesh(new THREE.CylinderGeometry(0.058, 0.058, 0.08, 16), steel);
+    hubO.rotation.x = Math.PI / 2; wheel.add(hubO);
+    const hubC = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.026, 0.10, 12), kingMat);
+    hubC.rotation.x = Math.PI / 2; wheel.add(hubC);
+    for (let i = 0; i < 6; i++) {
+      const a = i * Math.PI / 3 + Math.PI / 2;     // spoke 0 points straight up amidships
+      const king = i === 0;
+      const sp = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.014, R - 0.05, 8),
+        king ? kingMat : steel);
+      sp.position.set(Math.cos(a) * (R + 0.05) / 2, Math.sin(a) * (R + 0.05) / 2, 0);
+      sp.rotation.z = a - Math.PI / 2;
+      wheel.add(sp);
+      const knob = new THREE.Mesh(new THREE.SphereGeometry(0.03, 12, 9), king ? kingMat : steel);
+      knob.position.set(Math.cos(a) * (R - 0.015), Math.sin(a) * (R - 0.015), 0.028);
+      wheel.add(knob);
+    }
+    // king-spoke marker on the rim — tells you instantly how much helm is on
+    const mark = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.075, 0.05), kingMat);
+    mark.position.set(0, R, 0); wheel.add(mark);
+
+    // eye point for the first-person helm camera, rigidly on the boat
+    const helmEye = new THREE.Object3D();
+    helmEye.position.set(2.05, 5.15, -0.90); g.add(helmEye);
+
+    // spray shield across the front of the flybridge
+    const shield = new THREE.Mesh(new THREE.BoxGeometry(6.0, 0.52, 0.06),
+      new THREE.MeshPhongMaterial({ color: 0x9fb4bf, transparent: true, opacity: 0.30,
+        shininess: 140, side: THREE.DoubleSide }));
+    shield.position.set(0, 3.95, -2.6); shield.rotation.x = -0.16; g.add(shield);
     const seat = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.42, 0.6), white);
     seat.position.set(1.6, 4.05, -0.35); g.add(seat);
     const seatB = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.6, 0.14), white);
@@ -1556,13 +1621,60 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       ln(new THREE.Vector3(0, 12, -1.2), new THREE.Vector3(s * 3.1, 1.55, 0.4));
     }
 
-    const tram = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.05, 4.0),
-      new THREE.MeshLambertMaterial({ color: 0x3d4a52, transparent: true, opacity: 0.9 }));
-    tram.position.set(0, 1.62, -5.2); g.add(tram);
-    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 6.2, 8), white);
+    /* ---- foredeck: this is the whole forward view from the helm, so it is
+       worth the geometry — netting, windlass, anchor and pulpit give you
+       something to judge distance and heading against. ------------------- */
+    const netCv = document.createElement('canvas'); netCv.width = netCv.height = 64;
+    const ng = netCv.getContext('2d');
+    ng.clearRect(0, 0, 64, 64);
+    ng.strokeStyle = '#39434a'; ng.lineWidth = 5;
+    for (let i = 0; i <= 4; i++) {
+      const p = i * 16;
+      ng.beginPath(); ng.moveTo(p, 0); ng.lineTo(p, 64); ng.stroke();
+      ng.beginPath(); ng.moveTo(0, p); ng.lineTo(64, p); ng.stroke();
+    }
+    const netTex = new THREE.CanvasTexture(netCv);
+    netTex.wrapS = netTex.wrapT = THREE.RepeatWrapping; netTex.repeat.set(9, 7);
+    const netMat = new THREE.MeshLambertMaterial({ map: netTex, transparent: true,
+      alphaTest: 0.35, side: THREE.DoubleSide });
+    for (const s of [-1, 1]) {
+      const tr = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 4.2), netMat);
+      tr.rotation.x = -Math.PI / 2;
+      tr.position.set(s * 1.55, 1.60, -5.3); g.add(tr);
+    }
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 6.2, 10), white);
     beam.rotation.z = Math.PI / 2; beam.position.set(0, 1.6, -7.1); g.add(beam);
-    const spr = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.22, 1.8), white);
-    spr.position.set(0, 1.7, -8.1); g.add(spr);
+    const spr = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.22, 1.9), white);
+    spr.position.set(0, 1.72, -8.15); g.add(spr);
+    // anchor on the bow roller
+    const anch = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.1, 0.62),
+      new THREE.MeshPhongMaterial({ color: 0x9aa2a8, shininess: 80 }));
+    anch.position.set(0, 1.70, -8.85); g.add(anch);
+    // windlass
+    const wl = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.18, 0.52), grey);
+    wl.position.set(0, 1.76, -7.5); g.add(wl);
+    const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.16, 12), steel);
+    drum.rotation.z = Math.PI / 2; drum.position.set(0.26, 1.82, -7.5); g.add(drum);
+    // bow pulpit
+    for (const s of [-1, 1]) {
+      const pu = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 0.7, 6), steel);
+      pu.position.set(s * (sep - 0.35), 2.0, -7.55); g.add(pu);
+    }
+    // coachroof hatches
+    for (const dz of [-3.2, -4.6]) {
+      const ht2 = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.09, 0.7),
+        new THREE.MeshPhongMaterial({ color: 0x24323b, shininess: 110 }));
+      ht2.position.set(0, 1.68, dz); g.add(ht2);
+    }
+    // mast spreaders — give the rig some depth from the helm
+    for (const h of [9.2, 14.6]) {
+      const sw = h < 12 ? 2.3 : 1.8;
+      for (const s of [-1, 1]) {
+        const sprd = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, sw, 6), grey);
+        sprd.rotation.z = Math.PI / 2; sprd.rotation.y = 0.22 * s;
+        sprd.position.set(s * sw / 2, h, -1.2); g.add(sprd);
+      }
+    }
     for (const s of [-1, 1]) for (let i = 0; i < 7; i++) {
       const st = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.62, 5), grey);
       st.position.set(s * (sep + 0.95), 1.95, -7 + i * 2); g.add(st);
@@ -1573,13 +1685,34 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       new THREE.MeshLambertMaterial({ color: 0x59636a }));
     rib.rotation.z = Math.PI / 2; rib.position.set(0, 1.55, 7.6); g.add(rib);
 
-    const mk = (c, x, y, z) => {
-      const m = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 6), new THREE.MeshBasicMaterial({ color: c }));
-      m.position.set(x, y, z); g.add(m); return m;
+    /* Navigation lights, drawn as glows. Red to port and green to starboard on
+       the bows with a white light aft is the actual way you tell which end of
+       a boat you are looking at, so make them legible. */
+    const glowTex = (() => {
+      const c = document.createElement('canvas'); c.width = c.height = 64;
+      const q = c.getContext('2d');
+      const gr = q.createRadialGradient(32, 32, 0, 32, 32, 32);
+      gr.addColorStop(0, 'rgba(255,255,255,1)');
+      gr.addColorStop(0.18, 'rgba(255,255,255,.9)');
+      gr.addColorStop(0.45, 'rgba(255,255,255,.28)');
+      gr.addColorStop(1, 'rgba(255,255,255,0)');
+      q.fillStyle = gr; q.fillRect(0, 0, 64, 64);
+      return new THREE.CanvasTexture(c);
+    })();
+    const mk = (c, x, y, z, size) => {
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.075, 10, 8),
+        new THREE.MeshBasicMaterial({ color: c }));
+      m.position.set(x, y, z); g.add(m);
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, color: c,
+        transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.9 }));
+      sp.scale.setScalar(size || 0.9); sp.position.set(x, y, z); g.add(sp);
+      return m;
     };
     const lights = {
-      port: mk(0xff2b2b, -(sep + 1), 1.75, -7), stbd: mk(0x27d15a, sep + 1, 1.75, -7),
-      stern: mk(0xfff0d0, 0, 1.9, 7.7), steam: mk(0xfff4dc, 0, 13.5, -1.2)
+      port: mk(0xff2b2b, -(sep + 0.95), 1.9, -7.2, 1.0),
+      stbd: mk(0x27d15a, sep + 0.95, 1.9, -7.2, 1.0),
+      stern: mk(0xfff0d0, 0, 2.0, 7.7, 0.9),
+      steam: mk(0xfff4dc, 0, 13.5, -1.2, 0.7)
     };
     const fenders = [];
     for (const s of [-1, 1]) for (let i = 0; i < 3; i++) {
@@ -1588,7 +1721,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       f.position.set(s * (sep + SPEC.hullBeam / 2 + 0.16), 0.95, -3 + i * 3.2);
       g.add(f); fenders.push(f);
     }
-    g.userData = { lights, wheel, props, fenders };
+    g.userData = { lights, wheel, props, fenders, helmEye };
     return g;
   }
 
@@ -1754,7 +1887,12 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
         this.thrust[i] = pf.T * td;
         this.propQ[i] = pf.Q;
         X += this.thrust[i];
-        N += this.thrust[i] * yh;                       // the differential-thrust couple
+        // Differential-thrust couple. A longitudinal force at lateral offset
+        // yh gives N = −yh·Fx (same convention as the strip loop above), so
+        // the PORT engine ahead (yh<0) swings the bow to STARBOARD — the way
+        // a tank turns on its tracks. Getting this backwards inverts the
+        // single most important control on a twin-screw boat.
+        N -= this.thrust[i] * yh;
         if (this.gear[i] < 0) {                         // prop walk (counter-rotating pair)
           const walk = 0.045 * this.thrust[i] * side;
           Y += walk; N += walk * S.propX;
@@ -2029,7 +2167,9 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       g.position.set(this.x, this.heave, this.z);
       g.rotation.set(0, 0, 0);
       g.rotateY(-this.h); g.rotateX(this.pitch); g.rotateZ(this.heel);
-      if (g.userData.wheel) g.userData.wheel.rotation.z = -this.rud * 0.055;
+      // ~1.1 turns of wheel each way for 35° of rudder, so the spokes visibly
+      // sweep as you steer instead of nudging a few degrees
+      if (g.userData.wheel) g.userData.wheel.rotation.z = -this.rud * 0.20;
       for (let i = 0; i < g.userData.props.length; i++)
         g.userData.props[i].rotation.z += this.rpm[i] / S.gearRatio / 60 * this.gear[i] * dt * 6.2;
 
@@ -2635,6 +2775,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
   let running = false, paused = false, t = 0, elapsed = 0, last = 0;
   let camMode = 0, target = null, scen = null;
   const camPos = new THREE.Vector3(), camAim = new THREE.Vector3();
+  const camUp = new THREE.Vector3(0, 1, 0);
 
   /* ------------------------------------------------------- environment --- */
   const env = {
@@ -2780,6 +2921,8 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
   function syncCamButtons() {
     document.querySelectorAll('#cams button').forEach(b =>
       b.classList.toggle('on', +b.dataset.cam === camMode));
+    // helm view shows the real wheel, so the HUD gets out of its way
+    document.body.classList.toggle('helmcam', camMode === 0);
   }
 
   /* ------------------------------------------------------------ cameras -- */
@@ -2790,16 +2933,21 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     const fwd = new THREE.Vector3(sh, 0, -ch);
     const stb = new THREE.Vector3(ch, 0, sh);
     let want = new THREE.Vector3(), aim = new THREE.Vector3(), lerpK = 0.14, fov = 58;
+    camUp.set(0, 1, 0);
 
-    if (camMode === 0) {                       // flybridge helm, starboard side
-      // standing eye height on the flybridge sole (3.62 m) is about 5.2 m,
-      // just aft of the console and clear of the mast
-      const off = new THREE.Vector3().addScaledVector(fwd, 0.9).addScaledVector(stb, 2.05);
-      want.copy(bp).add(off); want.y = bp.y + 5.18;
-      const yaw = h + L.yaw, p = L.pitch - 0.06;
-      aim.set(want.x + Math.sin(yaw) * Math.cos(p) * 30, want.y + Math.sin(p) * 30,
-              want.z - Math.cos(yaw) * Math.cos(p) * 30);
-      lerpK = 0.5; fov = 62;
+    if (camMode === 0) {
+      // Flybridge helm. Rigidly attached to the boat via the helmEye node, so
+      // the view pitches, rolls and heaves with her and the wheel stays put in
+      // the frame. No smoothing — a helm camera that lags feels seasick.
+      const mesh = boat.mesh, eye = mesh.userData.helmEye;
+      mesh.updateMatrixWorld(true);
+      eye.getWorldPosition(want);
+      const p = L.pitch - 0.05, yw = L.yaw;
+      aim.set(Math.sin(yw) * Math.cos(p) * 40, Math.sin(p) * 40, -Math.cos(yw) * Math.cos(p) * 40)
+         .add(eye.position);
+      mesh.localToWorld(aim);
+      camUp.set(0, 1, 0).applyQuaternion(mesh.quaternion);   // roll with the boat
+      lerpK = 1; fov = 62;
     } else if (camMode === 1) {                // chase
       const yaw = h + L.yaw;
       const d = 36 * L.zoom;
@@ -2829,9 +2977,14 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     if (camPos.lengthSq() === 0) { camPos.copy(want); camAim.copy(aim); }
     const k = 1 - Math.pow(1 - lerpK, dt * 60);
     camPos.lerp(want, k); camAim.lerp(aim, k);
-    // never let the camera duck under the sea
-    const floor = Math.max(0.8, SIM.world.terrainY(camPos.x, camPos.z) + 1.2);
-    cam.position.set(camPos.x, Math.max(camPos.y, floor), camPos.z);
+    // the helm view is on the boat, so it must not be clamped to the sea floor
+    if (camMode === 0) {
+      cam.position.copy(camPos);
+    } else {
+      const floor = Math.max(0.8, SIM.world.terrainY(camPos.x, camPos.z) + 1.2);
+      cam.position.set(camPos.x, Math.max(camPos.y, floor), camPos.z);
+    }
+    cam.up.lerp(camUp, camMode === 0 ? 1 : 0.2).normalize();
     cam.lookAt(camAim);
     if (Math.abs(cam.fov - fov) > 0.1) { cam.fov += (fov - cam.fov) * 0.15; cam.updateProjectionMatrix(); }
   }
@@ -3127,7 +3280,10 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       SCEN, start: id => startScenario(SCEN.find(s => s.id === id)),
       setCam: m => { camMode = m; syncCamButtons(); },
       tick: (n, dt) => { for (let i = 0; i < n; i++) if (running) stepSim(dt || 0.02); },
-      get running() { return running; }
+      get running() { return running; },
+      get cam() { return cam; }, get scene() { return scene; },
+      get camMode() { return camMode; },
+      frameOnce: () => { boat.render(t, 0.016); updateCamera(0.016); renderer.render(scene, cam); }
     };
     last = performance.now();
     requestAnimationFrame(frame);
