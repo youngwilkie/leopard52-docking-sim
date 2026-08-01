@@ -53,6 +53,12 @@
     box-shadow:0 2px 6px rgba(0,0,0,.5);transition:none}
   .leverFill{position:absolute;left:0;right:0;background:var(--good);opacity:.5}
   .lever .rpm{font-family:var(--mono);font-size:11px;color:var(--dim)}
+  /* key hints printed on the controls themselves, so the bindings are
+     discoverable without going back to the menu */
+  .kk{font-family:var(--mono);font-size:8.5px;letter-spacing:0;color:var(--acc);
+    background:rgba(92,201,245,.12);border:1px solid rgba(92,201,245,.3);
+    border-radius:3px;padding:0 3px;margin-left:2px;white-space:nowrap}
+  body.mobile .kk{display:none}
   .lever .gear{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.08em}
   #wheelWrap{width:132px;text-align:center}
   #wheelCv{width:132px;height:132px;display:block}
@@ -277,17 +283,17 @@
 
   <div class="panel" id="ctl">
     <div class="lever">
-      <div class="lbl">Port</div>
+      <div class="lbl">Port <span class="kk">Q&nbsp;/&nbsp;A</span></div>
       <div class="leverTrack" id="trkP"><div class="leverFill" id="filP"></div><div class="mid"></div><div class="leverKnob" id="knbP"></div></div>
       <div class="gear" id="grP">N</div><div class="rpm" id="rpP">700</div>
     </div>
     <div id="wheelWrap">
       <canvas id="wheelCv" width="264" height="264"></canvas>
       <div id="rudBar"><div id="rudFill"></div></div>
-      <div class="lbl" style="margin-top:4px">Rudder <span class="val" id="vRud" style="font-size:11px">0°</span></div>
+      <div class="lbl" style="margin-top:4px">Rudder <span class="kk">←&nbsp;→</span> <span class="val" id="vRud" style="font-size:11px">0°</span></div>
     </div>
     <div class="lever">
-      <div class="lbl">Stbd</div>
+      <div class="lbl">Stbd <span class="kk">E&nbsp;/&nbsp;D</span></div>
       <div class="leverTrack" id="trkS"><div class="leverFill" id="filS"></div><div class="mid"></div><div class="leverKnob" id="knbS"></div></div>
       <div class="gear" id="grS">N</div><div class="rpm" id="rpS">700</div>
     </div>
@@ -2360,19 +2366,24 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
   }
 
   U.pollInput = function (dt, boat) {
-    const K = U.keys, rate = 0.85 * dt;
+    const K = U.keys, rate = 0.9 * dt;
     const bump = (i, d) => { boat.lever[i] = clamp(boat.lever[i] + d, -1, 1); };
-    if (K['q']) bump(0, rate); if (K['a']) bump(0, -rate);
-    if (K['e']) bump(1, rate); if (K['d']) bump(1, -rate);
-    if (K['w']) { bump(0, rate); bump(1, rate); }
-    if (K['s']) { bump(0, -rate); bump(1, -rate); }
-    for (let i = 0; i < 2; i++) if (Math.abs(boat.lever[i]) < 0.045) boat.lever[i] = 0;
 
-    const rr = 46 * dt;
+    const bothUp = K['w'] || K['arrowup'], bothDn = K['s'] || K['arrowdown'];
+    const pUp = K['q'] || bothUp, pDn = K['a'] || bothDn;
+    const sUp = K['e'] || bothUp, sDn = K['d'] || bothDn;
+    if (pUp) bump(0, rate); if (pDn) bump(0, -rate);
+    if (sUp) bump(1, rate); if (sDn) bump(1, -rate);
+
+    // Snap to neutral only once the lever is released. Applying it every frame
+    // re-zeroed the lever before a keypress could climb out of the dead zone,
+    // which killed the throttle keys entirely.
+    if (!pUp && !pDn && Math.abs(boat.lever[0]) < 0.05) boat.lever[0] = 0;
+    if (!sUp && !sDn && Math.abs(boat.lever[1]) < 0.05) boat.lever[1] = 0;
+
+    const rr = 42 * dt;
     if (K['arrowleft']) boat.rudCmd = clamp(boat.rudCmd - rr, -35, 35);
     if (K['arrowright']) boat.rudCmd = clamp(boat.rudCmd + rr, -35, 35);
-    if (K['arrowup']) { bump(0, rate); bump(1, rate); }
-    if (K['arrowdown']) { bump(0, -rate); bump(1, -rate); }
   };
 
   /* ------------------------------------------------------------ audio ---- */
