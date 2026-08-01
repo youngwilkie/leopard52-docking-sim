@@ -82,9 +82,13 @@
   #calls .c.w{border-color:var(--warn)} #calls .c.b{border-color:var(--bad)}
 
   /* ---- menu ---- */
+  /* align-items:center with overflow:auto makes the top of a tall menu
+     unreachable — the classic flex centring trap. flex-start + auto margins
+     centres when it fits and stays scrollable when it doesn't. */
   #menu{position:fixed;inset:0;background:radial-gradient(120% 90% at 50% 0%,#0d3348,#04101a 70%);
-    display:flex;align-items:center;justify-content:center;z-index:20;overflow:auto;padding:20px}
-  #menuInner{max-width:940px;width:100%}
+    display:flex;align-items:flex-start;justify-content:center;z-index:20;
+    overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:20px}
+  #menuInner{max-width:940px;width:100%;margin:auto}
   #menu h1{font-size:30px;margin:0;font-weight:800;letter-spacing:-.02em}
   #menu h1 span{color:var(--acc)}
   #menu .sub{color:var(--dim);font-size:13px;margin:6px 0 18px;line-height:1.5}
@@ -135,7 +139,10 @@
   #cams button.on{color:#04121c;background:var(--acc);border-color:var(--acc)}
 
   /* touch */
-  #touch{position:fixed;inset:0;display:none;z-index:6}
+  /* full-screen container, but it must NOT swallow taps — only the controls
+     inside it are interactive, otherwise the camera buttons and the
+     drag-to-look are dead everywhere on the screen */
+  #touch{position:fixed;inset:0;display:none;z-index:6;pointer-events:none}
   #touch .tl{position:absolute;bottom:16px;width:64px;height:190px;border-radius:32px;
     background:var(--panel);border:1px solid var(--edge);pointer-events:auto;touch-action:none}
   #touch .tl.p{left:14px} #touch .tl.s{left:88px}
@@ -191,8 +198,22 @@
   #touch .tw .th{top:5px;width:22px;height:44px;margin-left:-11px}
   body.mobile #touch .tl .th{left:4px;width:46px;height:20px;margin-top:-10px}
   body.mobile #touch .tw .th{top:4px;width:20px;height:46px;margin-left:-10px}
-  #touch .tl::after{content:'N';position:absolute;left:0;right:0;top:50%;margin-top:-6px;
-    text-align:center;font:700 9px var(--mono);color:rgba(255,255,255,.35)}
+  /* the desktop AHEAD/ASTERN panel is hidden on touch, so the sliders have to
+     say which way is which themselves */
+  #touch .tl{background:linear-gradient(180deg,rgba(63,214,160,.20),rgba(8,18,26,.72) 42%,
+    rgba(8,18,26,.72) 58%,rgba(255,95,86,.20))}
+  #touch .lab{position:absolute;left:0;right:0;text-align:center;pointer-events:none;
+    font:700 8px var(--mono);letter-spacing:.06em;color:rgba(255,255,255,.5)}
+  #touch .tl .lab.up{top:6px;color:rgba(63,214,160,.85)}
+  #touch .tl .lab.dn{bottom:6px;color:rgba(255,95,86,.85)}
+  #touch .tl .gr{position:absolute;left:0;right:0;top:50%;margin-top:-13px;text-align:center;
+    pointer-events:none;font:700 9px var(--mono);color:rgba(255,255,255,.42);
+    border-top:1px solid rgba(255,255,255,.22);padding-top:3px}
+  #touch .tl .rp{position:absolute;left:0;right:0;top:50%;margin-top:10px;text-align:center;
+    pointer-events:none;font:600 8px var(--mono);color:rgba(255,255,255,.32)}
+  #touch .tw .lab{top:50%;margin-top:-4px}
+  #touch .tw .lab.lt{left:8px;right:auto;text-align:left}
+  #touch .tw .lab.rt{right:8px;left:auto;text-align:right}
 
   body.mobile #menu{padding:12px}
   body.mobile #menu h1{font-size:21px} body.mobile #menu .sub{font-size:11.5px;margin-bottom:12px}
@@ -276,9 +297,20 @@
 </div>
 
 <div id="touch">
-  <div class="tl p" id="tlP"><div class="th" id="thP"></div></div>
-  <div class="tl s" id="tlS"><div class="th" id="thS"></div></div>
-  <div class="tw" id="tw"><div class="th" id="thW"></div></div>
+  <div class="tl p" id="tlP">
+    <span class="lab up">AHEAD</span><span class="gr" id="tgP">N</span>
+    <span class="rp" id="trP">PORT</span><span class="lab dn">ASTERN</span>
+    <div class="th" id="thP"></div>
+  </div>
+  <div class="tl s" id="tlS">
+    <span class="lab up">AHEAD</span><span class="gr" id="tgS">N</span>
+    <span class="rp" id="trS">STBD</span><span class="lab dn">ASTERN</span>
+    <div class="th" id="thS"></div>
+  </div>
+  <div class="tw" id="tw">
+    <span class="lab lt">◀ PORT</span><span class="lab rt">STBD ▶</span>
+    <div class="th" id="thW"></div>
+  </div>
 </div>
 
 <div id="rotate">
@@ -2144,10 +2176,21 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     U.drawW = bind($('tw'), $('thW'), v => { boat.rudCmd = v * 35; }, false, 0);
   };
 
-  // keep the touch handles in step when the levers move from anywhere else
+  // keep the touch handles in step when the levers move from anywhere else,
+  // and show which gear each shaft is actually in
   U.syncTouch = function (boat) {
     if (!U.drawP) return;
     U.drawP(boat.lever[0]); U.drawS(boat.lever[1]);
+    for (let i = 0; i < 2; i++) {
+      const el = $('tg' + (i ? 'S' : 'P'));
+      if (!el) continue;
+      const g = boat.gear[i];
+      el.textContent = boat.gearWait[i] > 0 ? '· · ·'
+        : g > 0 ? 'AHEAD ' + Math.round(boat.rpm[i])
+        : g < 0 ? 'ASTERN ' + Math.round(boat.rpm[i]) : 'NEUTRAL';
+      el.style.color = g > 0 ? 'rgba(63,214,160,.95)'
+        : g < 0 ? 'rgba(255,95,86,.95)' : 'rgba(255,255,255,.42)';
+    }
   };
 
   // throttle detents: neutral, idle-in-gear, then continuous
@@ -2725,7 +2768,9 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     });
 
     SIM.ui.initInput(boat, {
-      setCam: m => { camMode = m; syncCamButtons(); },
+      // recentre the look direction on every camera change — otherwise a stray
+      // swipe leaves you facing aft and ahead reads as astern
+      setCam: m => { camMode = m; SIM.ui.look.yaw = 0; SIM.ui.look.pitch = 0; syncCamButtons(); },
       restart: () => startScenario(scen),
       pause: () => { paused = !paused; SIM.ui.toast(paused ? 'PAUSED' : '', paused ? 'press P to resume' : '', paused ? 999999 : 1); },
       menu: () => openMenu()
