@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#08131f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Leopard 52 &mdash; St George&rsquo;s, Grenada</title>
+<style>
+  :root { --ink:#e8f2f8; --dim:#8fa8b8; --acc:#57d1c4; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body {
+    margin:0; padding:0; width:100%; height:100%; overflow:hidden;
+    background:#08131f; color:var(--ink);
+    font-family:"Helvetica Neue",Helvetica,Arial,"Segoe UI",sans-serif;
+    -webkit-user-select:none; user-select:none; touch-action:none;
+    overscroll-behavior:none;
+  }
+  #sail-canvas {
+    position:fixed; left:0; top:0; width:100%; height:100%;
+    display:block; z-index:10; outline:none;
+  }
+  #hud-root { position:fixed; left:0; top:0; width:100%; height:100%; z-index:40; pointer-events:none; }
+
+  /* ---------------------------------------------------------- start card */
+  #overlay {
+    position:fixed; inset:0; z-index:200; display:flex;
+    align-items:center; justify-content:center;
+    background:radial-gradient(ellipse at 50% 40%, #123049 0%, #08131f 70%);
+    transition:opacity .55s ease; padding:24px;
+  }
+  #overlay.gone { opacity:0; pointer-events:none; }
+  #card {
+    max-width:640px; width:100%; text-align:center;
+    padding:34px 30px 28px; border:1px solid rgba(120,190,210,.22);
+    border-radius:14px; background:rgba(6,18,28,.55);
+    box-shadow:0 24px 80px rgba(0,0,0,.55);
+  }
+  #card h1 {
+    margin:0 0 4px; font-size:26px; font-weight:300; letter-spacing:.30em;
+    text-transform:uppercase;
+  }
+  #card h2 {
+    margin:0 0 20px; font-size:11px; font-weight:400; letter-spacing:.34em;
+    text-transform:uppercase; color:var(--acc);
+  }
+  #card p.lede { margin:0 0 22px; font-size:13px; line-height:1.7; color:var(--dim); }
+  #keys {
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:6px 16px; margin:0 0 24px; font-size:11px; text-align:left;
+    color:var(--dim); line-height:1.65;
+  }
+  #keys b { color:var(--ink); font-weight:600; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  #go {
+    display:inline-block; padding:13px 40px; cursor:pointer;
+    border:1px solid var(--acc); border-radius:3px; background:transparent;
+    color:var(--acc); font-size:12px; letter-spacing:.30em; text-transform:uppercase;
+    font-family:inherit; transition:background .2s, color .2s;
+  }
+  #go:hover { background:var(--acc); color:#062028; }
+  #boot { margin-top:16px; font-size:10px; letter-spacing:.22em; color:#4d6a7c; text-transform:uppercase; }
+
+  /* ------------------------------------------------------- touch console */
+  #touch { position:fixed; inset:0; z-index:60; display:none; pointer-events:none; }
+  body.touch #touch { display:block; }
+  .stick {
+    position:absolute; bottom:22px; width:132px; height:132px; border-radius:50%;
+    border:1px solid rgba(150,210,225,.24); background:rgba(8,24,34,.28);
+    pointer-events:auto;
+  }
+  .stick i {
+    position:absolute; left:50%; top:50%; width:52px; height:52px; margin:-26px 0 0 -26px;
+    border-radius:50%; background:rgba(120,215,205,.30);
+    border:1px solid rgba(150,225,215,.45); pointer-events:none;
+  }
+  #stickL { left:22px; }
+  #stickR { right:22px; }
+  .stick span {
+    position:absolute; left:0; right:0; top:-17px; text-align:center;
+    font-size:9px; letter-spacing:.20em; color:#7fa3b4; text-transform:uppercase;
+  }
+  #tbtns { position:absolute; right:14px; top:38%; display:flex; flex-direction:column; gap:7px; pointer-events:auto; }
+  /* the HUD owns the outer band of the frame; keep the console clear of it */
+  @media (max-aspect-ratio: 1/1) {
+    .stick { bottom:198px; width:112px; height:112px; }
+    .stick i { width:44px; height:44px; margin:-22px 0 0 -22px; }
+    #tbtns { top:30%; }
+  }
+  #tbtns button {
+    width:52px; height:34px; border-radius:4px; cursor:pointer;
+    border:1px solid rgba(150,210,225,.28); background:rgba(8,24,34,.42);
+    color:#bcd8e4; font-size:10px; letter-spacing:.10em; font-family:inherit;
+  }
+  #tbtns button:active { background:rgba(87,209,196,.30); }
+
+  #err {
+    position:fixed; left:0; right:0; bottom:0; z-index:300; display:none;
+    max-height:36%; overflow:auto; padding:9px 13px;
+    background:rgba(60,8,8,.90); color:#ffc9c0; font-size:11px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; white-space:pre-wrap;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="sail-canvas"></canvas>
+<div id="hud-root"></div>
+
+<div id="touch">
+  <div id="tbtns">
+    <button data-act="cam">CAM</button>
+    <button data-act="trim">TRIM</button>
+    <button data-act="ease">EASE</button>
+    <button data-act="eng">ENG</button>
+  </div>
+  <div class="stick" id="stickL"><span>helm / throttle</span><i></i></div>
+  <div class="stick" id="stickR"><span>look</span><i></i></div>
+</div>
+
+<div id="overlay">
+  <div id="card">
+    <h1>Leopard&nbsp;52</h1>
+    <h2>St George&rsquo;s Lagoon &middot; Grenada</h2>
+    <p class="lede">
+      A 15.75&nbsp;m cruising catamaran on the north-east trades. Sail the buoyed channel
+      past Fort George, or bear away into open water to the west.
+    </p>
+    <div id="keys">
+      <div><b>W / S</b> &nbsp;throttle both</div>
+      <div><b>A / D</b> &nbsp;helm to port / starboard</div>
+      <div><b>X</b> &nbsp;centre the helm</div>
+      <div><b>drag mouse</b> &nbsp;look around</div>
+      <div><b>1 2 3 4</b> &nbsp;helm / cockpit / chase / orbit</div>
+      <div><b>[ ]</b> &nbsp;main sheet in / out</div>
+      <div><b>; '</b> &nbsp;jib sheet in / out</div>
+      <div><b>T</b> &nbsp;auto-trim &nbsp; <b>R</b> reef</div>
+      <div><b>P</b> &nbsp;hoist / stow sail</div>
+      <div><b>N</b> &nbsp;nav lights &nbsp; <b>L</b> deck light</div>
+      <div><b>H</b> &nbsp;hide HUD &nbsp; <b>M</b> mute</div>
+      <div><b>, .</b> &nbsp;time of day</div>
+    </div>
+    <button id="go">Take the helm</button>
+    <div id="boot">loading&hellip;</div>
+  </div>
+</div>
+
+<div id="err"></div>
+
+<script src="vendor/three.min.js"></script>
+<script src="js/sky.js?v=5"></script>
+<script src="js/ocean.js?v=5"></script>
+<script src="js/island.js?v=5"></script>
+<script src="js/yacht.js?v=5"></script>
+<script src="js/sails.js?v=5"></script>
+<script src="js/physics.js?v=5"></script>
+<script src="js/post.js?v=5"></script>
+<script src="js/hud.js?v=5"></script>
+<script src="js/app.js?v=5"></script>
+
+</body>
+</html>
