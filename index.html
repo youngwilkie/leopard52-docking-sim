@@ -148,6 +148,43 @@
   body.helmcam #calls{bottom:auto;top:212px;width:210px}
   body.mobile.helmcam #mission{left:132px;transform:none;max-width:150px}
 
+  /* ---------------- guided mode ---------------- */
+  #guide{top:96px;left:50%;transform:translateX(-50%);padding:9px 13px;width:392px;display:none}
+  body.guided #guide{display:block}
+  #gStep{font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:var(--acc);font-weight:700}
+  #gLabel{font-size:13.5px;font-weight:700;margin-top:2px;line-height:1.25}
+  #gWhy{font-size:11px;color:var(--dim);margin-top:4px;line-height:1.4}
+  #gCmds{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px}
+  .gc{background:rgba(255,255,255,.05);border:1px solid var(--edge);border-radius:7px;padding:5px 6px;text-align:center}
+  .gc .k{font-size:8px;letter-spacing:.12em;color:var(--dim);font-weight:700}
+  .gc .v{font-family:var(--mono);font-size:11.5px;font-weight:700;margin-top:2px;color:var(--warn)}
+  .gc.ok{background:rgba(63,214,160,.14);border-color:rgba(63,214,160,.5)}
+  .gc.ok .v{color:var(--good)}
+  #gAlert{margin-top:7px;font-size:11px;font-weight:700;color:var(--bad);display:none}
+  #gAlert.on{display:block}
+
+  /* ghost target markers on the real controls */
+  .leverTgt{position:absolute;left:-3px;right:-3px;height:0;border-top:2px dashed var(--warn);
+    pointer-events:none;display:none;z-index:3}
+  body.guided .leverTgt{display:block}
+  .leverTgt.ok{border-top-color:var(--good)}
+  #rudTgt{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--warn);
+    display:none;pointer-events:none}
+  body.guided #rudTgt{display:block}
+  #rudTgt.ok{background:var(--good)}
+  #touch .tgt{position:absolute;pointer-events:none;display:none;z-index:3}
+  body.guided #touch .tgt{display:block}
+  #touch .tl .tgt{left:-2px;right:-2px;height:0;border-top:2px dashed var(--warn)}
+  #touch .tl .tgt.ok{border-top-color:var(--good)}
+  #touch .tw .tgt{top:-2px;bottom:-2px;width:2px;background:var(--warn)}
+  #touch .tw .tgt.ok{background:var(--good)}
+
+  body.mobile #guide{top:auto;bottom:5px;left:132px;transform:none;width:auto;max-width:230px;padding:5px 8px}
+  body.mobile #gLabel{font-size:10px} body.mobile #gWhy{display:none}
+  body.mobile #gCmds{gap:3px;margin-top:4px} body.mobile .gc{padding:3px 4px}
+  body.mobile .gc .v{font-size:9px} body.mobile .gc .k{font-size:7px}
+  body.mobile.guided #mission{display:none}
+
   #cams{position:absolute;top:12px;right:220px;display:flex;gap:5px}
   #cams button{pointer-events:auto;background:var(--panel);border:1px solid var(--edge);color:var(--dim);
     border-radius:8px;padding:5px 9px;font-size:10px;font-weight:700;letter-spacing:.06em;cursor:pointer}
@@ -281,20 +318,32 @@
     <div id="missionBar"><div id="missionFill"></div></div>
   </div>
 
+  <div class="panel" id="guide">
+    <div id="gStep">Step 1 of 4</div>
+    <div id="gLabel">—</div>
+    <div id="gWhy">—</div>
+    <div id="gCmds">
+      <div class="gc" id="gcP"><div class="k">Port lever</div><div class="v" id="gvP">—</div></div>
+      <div class="gc" id="gcR"><div class="k">Wheel</div><div class="v" id="gvR">—</div></div>
+      <div class="gc" id="gcS"><div class="k">Stbd lever</div><div class="v" id="gvS">—</div></div>
+    </div>
+    <div id="gAlert"></div>
+  </div>
+
   <div class="panel" id="ctl">
     <div class="lever">
       <div class="lbl">Port <span class="kk">Q&nbsp;/&nbsp;A</span></div>
-      <div class="leverTrack" id="trkP"><div class="leverFill" id="filP"></div><div class="mid"></div><div class="leverKnob" id="knbP"></div></div>
+      <div class="leverTrack" id="trkP"><div class="leverFill" id="filP"></div><div class="mid"></div><div class="leverTgt" id="tgtP"></div><div class="leverKnob" id="knbP"></div></div>
       <div class="gear" id="grP">N</div><div class="rpm" id="rpP">700</div>
     </div>
     <div id="wheelWrap">
       <canvas id="wheelCv" width="264" height="264"></canvas>
-      <div id="rudBar"><div id="rudFill"></div></div>
+      <div id="rudBar"><div id="rudFill"></div><div id="rudTgt"></div></div>
       <div class="lbl" style="margin-top:4px">Rudder <span class="kk">←&nbsp;→</span> <span class="val" id="vRud" style="font-size:11px">0°</span></div>
     </div>
     <div class="lever">
       <div class="lbl">Stbd <span class="kk">E&nbsp;/&nbsp;D</span></div>
-      <div class="leverTrack" id="trkS"><div class="leverFill" id="filS"></div><div class="mid"></div><div class="leverKnob" id="knbS"></div></div>
+      <div class="leverTrack" id="trkS"><div class="leverFill" id="filS"></div><div class="mid"></div><div class="leverTgt" id="tgtS"></div><div class="leverKnob" id="knbS"></div></div>
       <div class="gear" id="grS">N</div><div class="rpm" id="rpS">700</div>
     </div>
   </div>
@@ -321,17 +370,17 @@
   <div class="tl p" id="tlP">
     <span class="lab up">AHEAD</span><span class="gr" id="tgP">N</span>
     <span class="rp" id="trP">PORT</span><span class="lab dn">ASTERN</span>
-    <div class="th" id="thP"></div>
+    <div class="tgt" id="ttP"></div><div class="th" id="thP"></div>
   </div>
   <div class="tl s" id="tlS">
     <span class="lab up">AHEAD</span><span class="gr" id="tgS">N</span>
     <span class="rp" id="trS">STBD</span><span class="lab dn">ASTERN</span>
-    <div class="th" id="thS"></div>
+    <div class="tgt" id="ttS"></div><div class="th" id="thS"></div>
   </div>
   <div class="tw" id="tw">
     <span class="lab lt">◀ PORT</span><span class="lab rt">STBD ▶</span>
     <span class="ctr"></span>
-    <div class="th" id="thW"></div>
+    <div class="tgt" id="ttW"></div><div class="th" id="thW"></div>
   </div>
   <span class="rudlab" id="trW">MIDSHIPS</span>
 </div>
@@ -362,6 +411,12 @@
     <div class="sl"><label>Swell <b><span id="lSw">0.8</span> m</b></label><input type="range" id="sSw" min="0" max="30" value="8"></div>
     <div class="sl"><label>Time of day <b><span id="lTd">14:00</span></b></label><input type="range" id="sTd" min="6" max="19" value="14"></div>
     <div class="sl"><label>Engines <b><span id="lEn">57 hp</span></b></label><input type="range" id="sEn" min="0" max="1" value="0"></div>
+    <div class="sl"><label>Guided mode <b><span id="lGd">ON</span></b></label><input type="range" id="sGd" min="0" max="1" value="1"></div>
+  </div>
+  <div style="font-size:11.5px;color:var(--dim);margin-top:8px;line-height:1.5">
+    <b style="color:var(--acc)">Guided mode</b> works out the manoeuvre from where you actually are and shows you
+    the exact lever and wheel positions to match — dashed markers appear on your controls and turn
+    green when you are on target. Press <kbd>G</kbd> in the sim to turn it on or off.
   </div>
 
   <button id="go">Start engines</button>
@@ -1065,7 +1120,9 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
         new THREE.MeshLambertMaterial({ color: 0xd8dde0 }));
       p.position.set(fx + dx, 1.3, fz + 1.4); scene.add(p);
     }
-    W.berths.push({ id: 'fuel', x: fx, z: fz - 6.6, hdg: 270, width: 34, kind: 'alongside',
+    // Heading 090: you come up the lagoon from the west and lie head-east along
+    // the dock. It used to say 270, which pointed the approach into the beach.
+    W.berths.push({ id: 'fuel', x: fx, z: fz - 6.6, hdg: 90, width: 34, kind: 'alongside',
       side: 'stbd', entryX: fx - 120, entryZ: fz - 6.6 });
 
     // ---- Med-moor quay following the northern shoreline arc ---------------
@@ -2217,6 +2274,315 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
 
 ;
 /* ==========================================================================
+   coach.js — guided mode
+   --------------------------------------------------------------------------
+   Not a scripted tape of instructions. It runs a closed-loop controller from
+   wherever the boat actually is — allowing for wind, current and the way she
+   is already swinging — and then reports its OWN control outputs as targets
+   for the helmsman to match. Follow the ghost markers and the manoeuvre works.
+
+   The plan is a list of steps; each step has a point to get to, an attitude to
+   hold there and a speed to be doing. The controller flies the boat between
+   them, exactly as it would if it were driving.
+   ========================================================================== */
+(function () {
+  const C = {};
+  SIM.coach = C;
+
+  const D2R = Math.PI / 180, KN = 1.94384;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const wrap = d => ((d + 540) % 360) - 180;
+
+  C.enabled = false;
+  C.plan = null;
+  C.stepIdx = 0;
+  C.out = null;
+
+  /* ------------------------------------------------------------- planning */
+  // Berth frame: f = the direction the boat points when correctly berthed.
+  function berthFrame(hdg) {
+    const r = hdg * D2R;
+    return { fx: Math.sin(r), fz: -Math.cos(r), sx: Math.cos(r), sz: Math.sin(r) };
+  }
+  const off = (b, F, along, across) => ({
+    x: b.x + F.fx * along + F.sx * (across || 0),
+    z: b.z + F.fz * along + F.sz * (across || 0)
+  });
+
+  C.build = function (scen, berth) {
+    C.stepIdx = 0; C.legIdx = -1; C.legFrom = null;
+    if (!scen || !berth) { C.plan = null; return null; }
+    const F = berthFrame(berth.hdg);
+    const H = berth.hdg;
+    const back = (H + 180) % 360;
+    let steps;
+
+    if (berth.kind === 'ball') {
+      steps = [
+        { pt: off(berth, F, -34), hdg: H, spd: 1.8, tol: 9,
+          label: 'Approach the ball from downwind',
+          why: 'Come at it slowly with the wind on the nose so she stops herself.' },
+        { pt: off(berth, F, -18), hdg: H, spd: 1.0, tol: 5,
+          label: 'Line up on the ball', why: 'Keep it dead ahead over the bow.' },
+        { pt: off(berth, F, -7.8), hdg: H, spd: 0.4, tol: 3,
+          label: 'Walk up to it', why: 'The ball should disappear under the bow.' },
+        { pt: off(berth, F, -7.8), hdg: H, spd: 0, tol: 2, hold: true,
+          label: 'Stop with the ball at the bow', why: 'Hold her here for the crew to hook it.' }
+      ];
+    } else if (berth.kind === 'med') {
+      steps = [
+        { pt: { x: berth.ballX, z: berth.ballZ }, hdg: back, spd: 1.6, tol: 9,
+          label: 'Pick up the mooring ball', why: 'Bow to the ball first — that line holds you off the quay.' },
+        { pt: off(berth, F, 26), hdg: H, spd: 0.9, tol: 6,
+          label: 'Square her up, stern to the quay', why: 'Get the stern pointing where you want it before you back.' },
+        { pt: off(berth, F, 8), hdg: H, spd: -0.6, tol: 4,
+          label: 'Back down onto the quay', why: 'Astern in small bites — the bow line is paying out behind you.' },
+        { pt: berth, hdg: H, spd: 0, tol: 3, hold: true,
+          label: 'Stop with the transom off the wall', why: 'Close enough to step ashore, not close enough to hit it.' }
+      ];
+    } else if (berth.kind === 'alongside') {
+      steps = [
+        { pt: off(berth, F, -60, -14), hdg: H, spd: 2.0, tol: 10,
+          label: 'Run in parallel, well off the dock', why: 'Set up a lane parallel to the face before you commit.' },
+        { pt: off(berth, F, -14, -9), hdg: H, spd: 1.0, tol: 5,
+          label: 'Slow to walking pace', why: 'Everything from here happens at the speed you can step off at.' },
+        { pt: off(berth, F, 0, -4.5), hdg: H, spd: 0.4, tol: 4,
+          label: 'Ferry her sideways in', why: 'Let the wind set you down onto the dock — do not drive at it.' },
+        { pt: berth, hdg: H, spd: 0, tol: 3, hold: true,
+          label: 'Hold her alongside', why: 'Nothing is tied on — keep station on the engines.' }
+      ];
+    } else if (scen.stern) {
+      steps = [
+        { pt: off(berth, F, -46), hdg: H, spd: 1.8, tol: 9,
+          label: 'Come up outside the slip', why: 'Get to the mouth of the slip before you do anything clever.' },
+        { pt: off(berth, F, -34), hdg: back, spd: 0, tol: 8, turn: true, station: true,
+          label: 'Turn her round in her own length', why: 'Split the throttles — one ahead, one astern — and let her spin.' },
+        { pt: off(berth, F, -16), hdg: back, spd: -0.8, tol: 5,
+          label: 'Start backing in', why: 'No rudder authority astern. Steer with the throttles only.' },
+        { pt: off(berth, F, -4), hdg: back, spd: -0.45, tol: 3.5,
+          label: 'Keep her straight between the fingers', why: 'The bow will fall off downwind — catch it early with a bump ahead.' },
+        { pt: berth, hdg: back, spd: 0, tol: 2, hold: true,
+          label: 'Stop her in the box', why: 'Short burst ahead on both to take the way off.' }
+      ];
+    } else {
+      steps = [
+        { pt: off(berth, F, -42), hdg: H, spd: 2.0, tol: 10,
+          label: 'Get onto the approach line', why: 'Line yourself up on the extended centreline of the slip.' },
+        { pt: off(berth, F, -20), hdg: H, spd: 1.1, tol: 5,
+          label: 'Line her up and slow down', why: 'Crab into the wind so you track straight down the line.' },
+        { pt: off(berth, F, -7), hdg: H, spd: 0.6, tol: 3.5,
+          label: 'Walk her into the slip', why: 'Dead slow. Fingers 3 m either side of the beam.' },
+        { pt: berth, hdg: H, spd: 0, tol: 2, hold: true,
+          label: 'Stop her in the box', why: 'Both astern briefly to kill the way, then neutral.' }
+      ];
+    }
+    // A waypoint computed purely from berth geometry can land on the beach or
+    // over a shoal. Walk any such point back toward the berth until it is in
+    // water we can actually float in.
+    const W = SIM.world;
+    if (W && W.depthAt) {
+      // A 15.75 m hull needs water under all of it, not just under the waypoint,
+      // so test a ring around each point too.
+      const floats = (p) => {
+        if (W.depthAt(p.x, p.z) < 3.4) return false;
+        for (let a = 0; a < 6; a++) {
+          const th = a * Math.PI / 3;
+          if (W.depthAt(p.x + Math.cos(th) * 9, p.z + Math.sin(th) * 9) < 2.8) return false;
+        }
+        return true;
+      };
+      for (const st of steps) {
+        if (st.hold) continue;          // the last mark IS the berth — never move it
+        let p = { x: st.pt.x, z: st.pt.z };
+        for (let i = 0; i < 30 && !floats(p); i++) {
+          p.x += (berth.x - p.x) * 0.12;
+          p.z += (berth.z - p.z) * 0.12;
+        }
+        st.pt = p;
+      }
+    }
+    C.plan = { steps, berth, scen, F };
+    return C.plan;
+  };
+
+  /* ------------------------------------------------------------ controller */
+  function levWord(v) {
+    const a = Math.abs(v);
+    if (a < 0.07) return 'NEUTRAL';
+    const dir = v > 0 ? 'AHEAD' : 'ASTERN';
+    if (a < 0.20) return 'IDLE ' + dir;
+    if (a < 0.45) return 'SLOW ' + dir;
+    if (a < 0.72) return 'HALF ' + dir;
+    return 'FULL ' + dir;
+  }
+
+  C.update = function (dt, boat, env, berth, scen) {
+    if (!C.enabled) { C.out = null; return null; }
+    if (!C.plan || C.plan.berth !== berth || C.plan.scen !== scen) C.build(scen, berth);
+    if (!C.plan) {
+      C.out = { free: true, label: 'Free practice', why: 'No berth set — nothing to guide you to.' };
+      return C.out;
+    }
+
+    const steps = C.plan.steps;
+    let s = steps[Math.min(C.stepIdx, steps.length - 1)];
+
+    // Advance when we reach the waypoint OR when we are already closer to the
+    // next one — a pure radius test lets a boat sail straight past a waypoint
+    // it never quite touched and then spend forever trying to get back to it.
+    const nxt = steps[C.stepIdx + 1];
+    const distS = Math.hypot(s.pt.x - boat.x, s.pt.z - boat.z);
+    const distN = nxt ? Math.hypot(nxt.pt.x - boat.x, nxt.pt.z - boat.z) : Infinity;
+    const hErrS = Math.abs(wrap(s.hdg - boat.hdg));
+    if (!s.hold && nxt) {
+      // A turn step is done when she is pointing the new way — full stop. You
+      // cannot hold a position while spinning in a beam wind (a boat has no
+      // sideways gear), so judging it on distance strands her downwind forever.
+      if (s.turn) { if (hErrS < 20) { C.stepIdx++; s = steps[C.stepIdx]; } }
+      else if (distS < s.tol || distN < distS) { C.stepIdx++; s = steps[C.stepIdx]; }
+    }
+
+    const dx = s.pt.x - boat.x, dz = s.pt.z - boat.z;
+    const dist = Math.hypot(dx, dz);
+    const astern = s.spd < -0.05;
+    const station = !!(s.hold || s.station);
+
+    // --- LINE-OF-SIGHT PATH FOLLOWING.
+    // Steer at a point a lookahead distance along the LEG (the line from where
+    // this step began to its waypoint), not at the waypoint itself. Cross-track
+    // error then decays instead of being chased, which is the only way to hold
+    // a centreline with three metres of finger pier either side.
+    if (C.legIdx !== C.stepIdx) {
+      C.legIdx = C.stepIdx;
+      C.legFrom = { x: boat.x, z: boat.z };
+    }
+    const from = C.legFrom || { x: boat.x, z: boat.z };
+    let pdx = s.pt.x - from.x, pdz = s.pt.z - from.z;
+    let plen = Math.hypot(pdx, pdz);
+    if (plen < 1) { pdx = dx; pdz = dz; plen = Math.max(dist, 0.001); }
+    const ux = pdx / plen, uz = pdz / plen;
+    const pathBrg = ((Math.atan2(ux, -uz) * 180 / Math.PI) + 360) % 360;
+    // starboard of the path direction is (-uz, ux)
+    const xte = (boat.x - from.x) * (-uz) + (boat.z - from.z) * ux;
+    const lookahead = clamp(dist * 0.8, 6, 22);
+    const losHdg = pathBrg + Math.atan2(-xte, lookahead) * 180 / Math.PI;
+
+    const arriveR = 12;
+    let wantHdg;
+    if (station || dist < 2.0) wantHdg = s.hdg;
+    else if (dist > arriveR) wantHdg = losHdg;
+    else wantHdg = s.hdg + wrap(losHdg - s.hdg) * (dist / arriveR);
+    if (astern && !station) wantHdg = (wantHdg + 180) % 360;
+
+    // aim a little into the set so she tracks straight rather than crabbing off
+    const setCorr = clamp(-(boat.v * KN) * 5.0, -16, 16) * (astern ? -1 : 1);
+    wantHdg = (wantHdg + setCorr + 360) % 360;
+    const hErr = wrap(wantHdg - boat.hdg);
+
+    // --- HOW FAST.
+    let wantSpd;
+    if (station) {
+      // creep back onto the mark: only the component ahead of the bow matters
+      const ahead = dx * Math.sin(boat.h) - dz * Math.cos(boat.h);
+      wantSpd = clamp(ahead * 0.16, -0.5, 0.5);
+      if (Math.abs(ahead) < 1.2) wantSpd = 0;
+    } else {
+      const ramp = clamp(dist / Math.max(8, Math.abs(s.spd) * 10), 0, 1);
+      wantSpd = s.spd * (0.25 + 0.75 * ramp);
+    }
+    // do not drive hard while badly misaligned — turn first, then go
+    wantSpd *= clamp(1 - Math.abs(hErr) / 70, 0.12, 1);
+
+    const uKn = boat.u * KN;
+    const spdErr = wantSpd - uKn;
+
+    let base = clamp(spdErr * 0.55, -0.65, 0.65);
+    if (station && Math.abs(wantSpd) < 0.02 && Math.abs(uKn) < 0.18) base = 0;
+
+    const rotDeg = boat.rot / 60;                 // deg/s
+    // Going astern she is directionally unstable — the bow falls off and keeps
+    // going — so catch it earlier and harder than when running ahead.
+    let yaw = astern
+      ? clamp(hErr * 0.055 - rotDeg * 0.50, -1, 1)
+      : clamp(hErr * 0.030 - rotDeg * 0.36, -1, 1);
+
+    // Rudder only earns its keep with flow over it. Below ~1.5 kn the wheel is
+    // nearly useless and everything is done on the throttles.
+    const flow = Math.abs(uKn);
+    let rud = 0, diff;
+    if (flow > 1.5 && !astern) {
+      rud = clamp(hErr * 1.9 - rotDeg * 9, -35, 35);
+      diff = clamp(yaw * 0.22, -0.30, 0.30);
+    } else if (astern) {
+      // Going astern the blade is nearly useless, so the couple does the work.
+      // She needs MORE authority here than going ahead, not less — this is the
+      // hardest thing on the boat to keep straight.
+      rud = flow > 1.2 ? clamp(-hErr * 1.1, -35, 35) : 0;
+      diff = clamp(yaw * 0.70, -0.85, 0.85);
+    } else {
+      rud = 0;
+      diff = clamp(yaw * 0.48, -0.60, 0.60);
+    }
+    // spinning on the spot: all the authority goes into the couple
+    if (s.turn) { diff = clamp(yaw * 0.95, -1, 1); rud = 0; }
+
+    // Positive `diff` means "turn to starboard", and on a twin screw that is
+    // MORE PORT thrust (the port engine pushes the port side forward, swinging
+    // the bow to starboard — a tank turning on its tracks). Reversing these two
+    // makes the coach steer the boat away from every waypoint.
+    let lp = clamp(base + diff, -1, 1);
+    let ls = clamp(base - diff, -1, 1);
+
+    // --- hazards worth shouting about
+    let alert = null;
+    if (boat.underKeel < 0.6) alert = 'SHALLOW — ' + boat.underKeel.toFixed(1) + ' m under the keels';
+    else if (dist < 25 && uKn * KN > 0) {
+      const closingKn = (dx * (boat.u * Math.sin(boat.h) + boat.v * Math.cos(boat.h))
+        + dz * (-boat.u * Math.cos(boat.h) + boat.v * Math.sin(boat.h))) / Math.max(dist, 0.5) * KN;
+      if (closingKn > 1.8) alert = 'TOO FAST — take the way off her now';
+    }
+    if (Math.abs(boat.rot) > 55) alert = 'Rate of turn building — check her with the outside engine';
+    // The instructor's most useful line: if you are not lined up, do not force
+    // it. Take her out and set up again.
+    if (!station && Math.abs(xte) > 4.5 && dist < 30 && C.stepIdx >= steps.length - 2)
+      alert = 'You are ' + Math.abs(xte).toFixed(1) + ' m off the line — go round and set up again';
+
+    const why = s.why + (Math.abs(setCorr) > 5 && !s.turn
+      ? '  Aim ' + Math.abs(Math.round(setCorr)) + '° ' + (setCorr > 0 ? 'to starboard' : 'to port')
+        + ' of where you want to go — she is being set sideways.' : '');
+
+    C.out = {
+      free: false,
+      step: C.stepIdx + 1, steps: steps.length,
+      label: s.label, why,
+      leverP: lp, leverS: ls, rudder: rud,
+      textP: levWord(lp), textS: levWord(ls),
+      textR: Math.abs(rud) < 1.5 ? 'MIDSHIPS'
+        : Math.round(Math.abs(rud)) + '° ' + (rud > 0 ? 'STARBOARD' : 'PORT'),
+      matchP: Math.abs(boat.lever[0] - lp) < 0.12,
+      matchS: Math.abs(boat.lever[1] - ls) < 0.12,
+      matchR: Math.abs(boat.rud - rud) < 4,
+      alert,
+      dist
+    };
+    return C.out;
+  };
+
+  // waypoint track for the radar
+  C.track = function () {
+    if (!C.plan) return null;
+    return C.plan.steps.map((s, i) => ({ x: s.pt.x, z: s.pt.z, done: i < C.stepIdx }));
+  };
+
+  C.reset = function () {
+    C.stepIdx = 0; C.plan = null; C.out = null;
+    C.legIdx = -1; C.legFrom = null;
+  };
+  C.legIdx = -1; C.legFrom = null;
+})();
+
+;
+/* ==========================================================================
    ui.js — instruments, controls and synthesized audio
    ========================================================================== */
 (function () {
@@ -2241,6 +2607,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       if (k === 'p') U.hooks.pause && U.hooks.pause();
       if (k === 'm') U.hooks.menu && U.hooks.menu();
       if (k === 'h') U.toggleMute();
+      if (k === 'g' && U.hooks.guide) U.hooks.guide();
       if (k === 'n') U.headUp = !U.headUp;
       if (k === ' ') { boat.lever[0] = 0; boat.lever[1] = 0; }
       if (k === 'x') boat.rudCmd = 0;
@@ -2584,6 +2951,20 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       g.restore();
     }
 
+    // the coach's planned track
+    const trk = SIM.coach && SIM.coach.enabled && SIM.coach.track && SIM.coach.track();
+    if (trk && trk.length) {
+      g.strokeStyle = 'rgba(255,194,71,.75)'; g.lineWidth = 1.3 / ppm;
+      g.setLineDash([4 / ppm, 3 / ppm]);
+      g.beginPath(); g.moveTo(boat.x, boat.z);
+      for (const w of trk) g.lineTo(w.x, w.z);
+      g.stroke(); g.setLineDash([]);
+      for (const w of trk) {
+        g.fillStyle = w.done ? 'rgba(63,214,160,.85)' : '#ffc247';
+        g.beginPath(); g.arc(w.x, w.z, 1.6, 0, 6.284); g.fill();
+      }
+    }
+
     // own boat, drawn to scale (15.75 × 8.16)
     g.save(); g.translate(boat.x, boat.z); g.rotate(-boat.h);
     g.fillStyle = '#5cc9f5';
@@ -2746,6 +3127,40 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     gEl.style.color = gr > 0 ? '#3fd6a0' : gr < 0 ? '#ff5f56' : '#9fb3bd';
     $('rp' + prefix).textContent = Math.round(b.rpm[idx]);
   }
+
+  /* ------------------------------------------------------ guided mode ---- */
+  // Paints the coach's own control outputs onto the real controls as ghost
+  // targets, so "how much wheel" is something you match rather than guess.
+  U.showGuidance = function (g, boat) {
+    const on = !!g && !g.free;
+    document.body.classList.toggle('guided', !!g);
+    if (!on) return;
+    $('gStep').textContent = 'Step ' + g.step + ' of ' + g.steps;
+    $('gLabel').textContent = g.label;
+    $('gWhy').textContent = g.why;
+    $('gvP').textContent = g.textP; $('gvS').textContent = g.textS; $('gvR').textContent = g.textR;
+    $('gcP').classList.toggle('ok', g.matchP);
+    $('gcS').classList.toggle('ok', g.matchS);
+    $('gcR').classList.toggle('ok', g.matchR);
+    const al = $('gAlert');
+    al.textContent = g.alert || ''; al.classList.toggle('on', !!g.alert);
+
+    // desktop lever ghosts
+    const pos = (el, v, ok) => {
+      if (!el) return;
+      el.style.top = ((1 - (v + 1) / 2) * 100) + '%';
+      el.classList.toggle('ok', ok);
+    };
+    pos($('tgtP'), g.leverP, g.matchP);
+    pos($('tgtS'), g.leverS, g.matchS);
+    const rt = $('rudTgt');
+    if (rt) { rt.style.left = ((g.rudder / 35) * 50 + 50) + '%'; rt.classList.toggle('ok', g.matchR); }
+    // touch ghosts
+    pos($('ttP'), g.leverP, g.matchP);
+    pos($('ttS'), g.leverS, g.matchS);
+    const tw = $('ttW');
+    if (tw) { tw.style.left = ((g.rudder / 35) * 50 + 50) + '%'; tw.classList.toggle('ok', g.matchR); }
+  };
 
   U.updateHUD = function (boat, env, target, elapsed) {
     $('vSog').innerHTML = boat.sog.toFixed(1) + '<span class="u">kn</span>';
@@ -2944,7 +3359,15 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       setCam: m => { camMode = m; SIM.ui.look.yaw = 0; SIM.ui.look.pitch = 0; syncCamButtons(); },
       restart: () => startScenario(scen),
       pause: () => { paused = !paused; SIM.ui.toast(paused ? 'PAUSED' : '', paused ? 'press P to resume' : '', paused ? 999999 : 1); },
-      menu: () => openMenu()
+      menu: () => openMenu(),
+      guide: () => {
+        if (!SIM.coach) return;
+        SIM.coach.enabled = !SIM.coach.enabled;
+        if (SIM.coach.enabled) SIM.coach.build(scen, target);
+        else document.body.classList.remove('guided');
+        SIM.ui.toast(SIM.coach.enabled ? 'GUIDED MODE ON' : 'GUIDED MODE OFF',
+          SIM.coach.enabled ? 'match the dashed markers on your controls' : 'you are on your own', 1800);
+      }
     });
   }
 
@@ -3027,6 +3450,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     score.contacts = 0; score.maxImpact = 0; score.grounds = 0; score.peakClose = 0;
     score.ballTaken = !s.ball; score.dockTimer = 0; score.done = false;
     elapsed = 0; camPos.set(0, 0, 0);
+    if (SIM.coach) { SIM.coach.reset(); if (SIM.coach.enabled) SIM.coach.build(s, target); }
     SIM.ui.look.yaw = 0; SIM.ui.look.pitch = 0;
     $('missionTitle').textContent = s.name;
     $('missionSub').textContent = s.blurb;
@@ -3046,10 +3470,11 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     // rotate into berth frame: along = toward the berth heading, across = beam
     const along = dx * Math.sin(rad) - dz * Math.cos(rad);
     const across = dx * Math.cos(rad) + dz * Math.sin(rad);
-    let hdgErr = ((boat.hdg - target.hdg + 540) % 360) - 180;
-    if (scen.stern || target.kind === 'med') {
-      // stern-to: the boat lies bow-out, heading is already stored bow-out
-    }
+    // Backing into a slip leaves her lying bow-OUT, so the acceptable heading is
+    // the reciprocal of the berth. (A med berth already stores its heading
+    // bow-out, so it needs no flip.)
+    const wantHdg = scen.stern ? (target.hdg + 180) % 360 : target.hdg;
+    const hdgErr = ((boat.hdg - wantHdg + 540) % 360) - 180;
     return { along, across, hdgErr, dist: Math.hypot(dx, dz) };
   }
 
@@ -3214,6 +3639,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
 
     evaluate(dt);
     callouts(dt);
+    if (SIM.coach) SIM.coach.update(dt, boat, env, target, scen);
   }
 
   function frame(now) {
@@ -3237,6 +3663,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
       SIM.world.update(t, dt, cam);
       SIM.world.updateWake(dt, boat.x, boat.z);
       SIM.ui.updateHUD(boat, env, target, elapsed);
+      SIM.ui.showGuidance(SIM.coach && SIM.coach.enabled ? SIM.coach.out : null, boat);
       SIM.ui.updateAudio(boat, env);
     }
     updateCamera(dt);
@@ -3278,6 +3705,7 @@ function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"f
     link('sSw', 'lSw', v => (v / 10).toFixed(1), v => env.swell = v / 10);
     link('sTd', 'lTd', v => String(v).padStart(2, '0') + ':00', v => env.hour = v);
     link('sEn', 'lEn', v => v ? '80 hp' : '57 hp', v => env.hp = v ? 80 : 57);
+    link('sGd', 'lGd', v => v ? 'ON' : 'OFF', v => { if (SIM.coach) SIM.coach.enabled = !!v; });
 
     $('go').onclick = () => {
       SIM.ui.initAudio();
