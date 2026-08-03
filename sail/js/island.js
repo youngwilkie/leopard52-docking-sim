@@ -56,6 +56,61 @@
     }
     return s / n;
   }
+  /* Ridged multifractal normalised to [0,1] with the octave weighting folded
+     into the normaliser, so the MEAN is stable no matter how many octaves run.
+     rmf() above divides by sum(a) but adds a*w*v, so its mean slides with the
+     octave count — fine for the one place it is used, useless as a carve field.
+     This one is the shared erosion basis: js and GLSL evaluate the same law.  */
+  function ridgeN(x, z, f0, oct, gain, lac) {
+    let s = 0, n = 0, a = 1, f = f0, prev = 1;
+    for (let k = 0; k < oct; k++) {
+      let v = vnoise(x * f, z * f);
+      v = 1 - Math.abs(v); v *= v;
+      const w = 0.30 + 0.70 * prev;
+      s += a * w * v; n += a * w;
+      prev = v; a *= gain; f *= lac;
+    }
+    return n > 1e-6 ? s / n : 0;
+  }
+  /* ANALYTIC EROSION. The 64 m coarse bake was band-limited at a 128 m
+     wavelength, so from 2-6 km — the entire island-approach frame — the massif
+     could not physically carry a ravine and rendered as a smooth dome. This is
+     the term that puts the ridge/spur skeleton back at 60-600 m, evaluated on
+     BOTH baked levels so the fine/coarse cross-fade stays seamless, and mirrored
+     octave-for-octave in the terrain shader's normal detail.
+     Sign convention: ridges (r->1) are pushed UP, basins (r->0) cut DOWN, about
+     a zero mean, so the summit heights the CONES define are preserved.        */
+  const ER_F0 = 1 / 640, ER_LAC = 2.11, ER_GAIN = 0.55, ER_MEAN = 0.46;
+  /* HIERARCHY. A single f0 evaluated over the whole massif gives every flank the
+     same striation pitch, which at 0.7 km and at 3 km is the same number of
+     screen pixels — the "corduroy / brushed metal" read, and the thing that
+     aliases into crunch at range. Real rain-cut drainage is scale-ordered: wide
+     deep trunk valleys draining to the sea, progressively finer tributaries as
+     you climb toward the divides. Two changes carry that here:
+       fsc  — the tributary wavelength SHRINKS with altitude (finer near the
+              crests) and is modulated by a 3 km field so no two flanks of the
+              island share a pitch.
+       trunk— a separate, much coarser ridged band whose amplitude is gated to
+              LOW ground, so the main valleys are genuinely wider and deeper
+              than the rills feeding them.                                     */
+  function erodeCarve(x, z, h, oct) {
+    if (h <= 2.5) return 0;
+    const g = sstep(2.5, 65, h);
+    // domain warp: an un-warped ridged field lays its valleys on the noise grid
+    // and reads as a woven basket at silhouette scale
+    const wx = x + fbm(x * 0.00058 + 5.1, z * 0.00058 - 2.3, 2) * 300;
+    const wz = z + fbm(x * 0.00058 - 8.7, z * 0.00058 + 6.9, 2) * 300;
+    const fsc = (0.50 + 1.45 * sstep(45, 430, h)) *
+      (0.74 + 0.58 * fbm(x * 0.00030 + 3.3, z * 0.00030 - 5.5, 2));
+    const r = ridgeN(wx, wz, ER_F0 * fsc, oct, ER_GAIN, ER_LAC);
+    const amp = Math.min(h * 0.30, 118) * g;
+    let out = amp * (Math.pow(clamp(r, 0, 1), 0.80) - ER_MEAN) * 2.0;
+    // trunk drainage: 1.8 km basins, cut only on the lower two thirds
+    const rT = ridgeN(wx * 0.34 + 91.0, wz * 0.34 - 43.0, ER_F0, Math.min(oct, 3), 0.58, 2.03);
+    const ampT = Math.min(h * 0.26, 96) * g * sstep(520, 70, h);
+    out += ampT * (Math.pow(clamp(rT, 0, 1), 0.85) - ER_MEAN) * 1.5;
+    return out;
+  }
   function segDist(px, pz, ax, az, bx, bz) {
     const dx = bx - ax, dz = bz - az;
     const t = clamp(((px - ax) * dx + (pz - az) * dz) / (dx * dx + dz * dz), 0, 1);
@@ -128,6 +183,20 @@
     [3240, 3450, 2050, 452, 1.48], [4260, 940, 2250, 664, 1.50], [5680, -2680, 2650, 806, 1.54],
     [6900, 2600, 2400, 592, 1.52], [1150, 4600, 1500, 348, 1.46]
   ];
+  /* Volcanic plugs and rock spines. A landmass built entirely from overlapping
+     radial cones has no landmarks: every summit is an arc and the skyline reads
+     as one smooth procedural envelope. These are hand-placed, deliberately
+     narrow and steep (falloff >= 2.6 against the cones' 1.3), so they punch
+     through the canopy line as notched crags rather than blending into it, and
+     they sit ON the visible flank in island-approach so the silhouette has
+     something to be interrupted by.   [cx, cz, radius, peak, falloff]         */
+  const PLUGS = [
+    [-368, -712, 118, 78, 3.0], [-300, -560, 92, 44, 3.4],
+    [188, -352, 104, 66, 2.9], [96, -196, 78, 38, 3.3],
+    [-462, -206, 86, 40, 3.1],
+    [962, -1246, 168, 104, 2.8], [2470, -1904, 232, 128, 2.7],
+    [4180, 1010, 300, 150, 2.7]
+  ];
   /* Analytic land elevation. The grid bake then runs a flow-accumulation pass
      over this, which is what cuts the dendritic V-drainages; the terms here
      supply the ridge/spur skeleton those valleys are cut into.                */
@@ -152,7 +221,28 @@
     hh += e * 0.28 * (r2 - 0.42);
     hh += Math.min(e, 280) * 0.11 * (r3 - 0.45);
     hh -= Math.min(hh, 420) * 0.17 * Math.pow(1 - r2, 2.2);
+    /* CREST FOLD. The maximum of a smooth field is a smooth cap: r1 and r2 are
+       ridged, but the octave weighting rounds every summit into an arc, which is
+       why the silhouette was two near-perfect cones with not one notch in it.
+       kx folds a mid-band ridged octave through (r-t) and SQUARES it, gated to
+       ground where the ridge skeleton is already high — so the crest pinches to
+       a knife edge instead of doming, and the flanks below are untouched.     */
+    const rk = ridgeN(wx, wz, 0.00185, 3, 0.56, 2.07);
+    const kx = Math.max(0, rk * 1.18 - 0.20);
+    const onCrest = sstep(0.30, 0.80, r1);
+    hh += Math.min(e, 340) * 0.46 * kx * kx * onCrest;
+    /* NOTCHES. A continuous crest is as synthetic as a smooth one. This cuts
+       saddles and cols through the ridge at a ~1 km spacing so the skyline is
+       interrupted, which is also what gives the eye separable landmarks.      */
+    const nt = vnoise(wx * 0.00098 + 21.3, wz * 0.00098 - 7.7);
+    hh -= Math.min(Math.max(hh, 0), 400) * 0.34 * Math.pow(sstep(0.36, 0.05, nt), 1.35) * onCrest;
     if (hh > 0) h += hh * ramp;
+    // rock spines / volcanic plugs: narrow, steep, and above the canopy line
+    for (let i = 0; i < PLUGS.length; i++) {
+      const c = PLUGS[i];
+      const dd = Math.hypot(x - c[0], z - c[1]) / c[2];
+      if (dd < 1) h += c[3] * Math.pow(1 - dd * dd, c[4]) * ramp;
+    }
     return Math.max(0.15, h);
   }
   const SHOALS = [
@@ -212,7 +302,12 @@
      headland beyond it used to be extrapolated from the clamped edge texel,
      which is exactly the flat welded hedge the review called out. This second
      level carries real terrain out to the visible horizon.                    */
-  const CS = 64, CX0 = -12000, CZ0 = -12000, CX1 = 12000, CZ1 = 12000;
+  /* 64 m cells band-limit the silhouette at a 128 m wavelength, which at the
+     2-6 km stand-off of island-approach is 30-70 SCREEN PIXELS: no ravine, no
+     spur and no serrated crest can exist in the data at all, whatever the
+     shader does. 28 m carries a 56 m feature, which is a real gully.         */
+  const CS = 32, CX0 = -12000, CZ0 = -12000, CX1 = 12000, CZ1 = 12000;
+  const ER_OCT_FINE = 6, ER_OCT_COARSE = 4;
   let CW = 0, CGH = 0, CHGT = null, CFLD = null, coarseTex = null;
   /* Land cover: R = road, G = settlement density. Sampled by the terrain shader
      and by the placement code so ground tint, buildings and roads agree.      */
@@ -286,33 +381,51 @@
       H[k] = sum / w;
     }
   }
-  // horizon-scan sky visibility + central-difference normals into an RGBA float field
+  /* CONE-TRACED SKY VISIBILITY. The old version summed a clamped TANGENT over
+     six azimuths, which is not an occlusion measure at all — it saturates the
+     moment any neighbour is steeper than ~36 degrees and it never resolves the
+     difference between a shallow bowl and a ravine. This marches eight azimuths
+     out to the radius list, records the maximum HORIZON ELEVATION per azimuth,
+     and integrates the cosine-weighted sky fraction 1 - sin(theta) properly. A
+     flat plain lands at 1.0, an exposed crest near 0.97, a valley floor between
+     0.35 and 0.5, which is the range the form actually needs to read.
+     A second, short-radius pass gives a separate CAVITY term so micro-relief —
+     the rill floors and the gully lips the long scan is too coarse to see —
+     darkens as well. Both are folded into the one .y channel every consumer
+     already reads, so nothing downstream changes shape.                       */
   function bakeAO(H, W, Hh, cell, radii, strength) {
     const F = new Float32Array(W * Hh * 4);
-    const DIRS = [[1, 0], [0.5, 0.866], [-0.5, 0.866], [-1, 0], [-0.5, -0.866], [0.5, -0.866]];
-    const ND = DIRS.length, NR = radii.length;
+    const ND = 8, NR = radii.length, NCAV = Math.min(2, NR);
     const OFF = new Int32Array(ND * NR * 2), INVL = new Float32Array(ND * NR);
-    for (let d = 0; d < ND; d++) for (let r = 0; r < NR; r++) {
-      const q = d * NR + r;
-      OFF[q * 2] = Math.round(DIRS[d][0] * radii[r]);
-      OFF[q * 2 + 1] = Math.round(DIRS[d][1] * radii[r]);
-      INVL[q] = 1 / (radii[r] * cell);
+    for (let d = 0; d < ND; d++) {
+      // rotated off the axes so an 8-way scan does not print a square bias
+      const a = (d + 0.28) / ND * 2 * PI, ca = Math.cos(a), sa = Math.sin(a);
+      for (let r = 0; r < NR; r++) {
+        const q = d * NR + r;
+        OFF[q * 2] = Math.round(ca * radii[r]);
+        OFF[q * 2 + 1] = Math.round(sa * radii[r]);
+        INVL[q] = 1 / (radii[r] * cell);
+      }
     }
     for (let j = 0; j < Hh; j++) for (let i = 0; i < W; i++) {
       const k = j * W + i, h = H[k];
-      let occ = 0;
+      let vis = 0, cav = 0;
       for (let d = 0; d < ND; d++) {
-        let mx = 0;
+        let mx = 0, mc = 0;
         for (let r = 0; r < NR; r++) {
           const q = d * NR + r;
           let ii = i + OFF[q * 2]; ii = ii < 0 ? 0 : (ii >= W ? W - 1 : ii);
           let jj = j + OFF[q * 2 + 1]; jj = jj < 0 ? 0 : (jj >= Hh ? Hh - 1 : jj);
           const s = (H[jj * W + ii] - h) * INVL[q];
           if (s > mx) mx = s;
+          if (r < NCAV && s > mc) mc = s;
         }
-        occ += mx * 1.35 > 1 ? 1 : mx * 1.35;
+        // 1 - sin(horizon) is the cosine-weighted sky fraction above that azimuth
+        vis += mx > 0 ? 1 - mx / Math.sqrt(1 + mx * mx) : 1;
+        cav += mc > 0 ? 1 - mc / Math.sqrt(1 + mc * mc) : 1;
       }
-      const ao = clamp(1 - occ / ND * strength, 0.10, 1);
+      vis /= ND; cav /= ND;
+      const ao = clamp((1 - strength * (1 - vis)) * (1 - 0.42 * (1 - cav)), 0.06, 1);
       const im = i > 0 ? i - 1 : 0, ip = i < W - 1 ? i + 1 : W - 1;
       const jm = j > 0 ? j - 1 : 0, jp = j < Hh - 1 ? j + 1 : Hh - 1;
       const nx = -(H[j * W + ip] - H[j * W + im]) / ((ip - im) * cell);
@@ -339,11 +452,17 @@
         const x = TX0 + i * GS, k = j * GW + i;
         const d = depthExact(x, z);
         DEP[k] = d;
-        HGT[k] = d < 0 ? landHeight(x, z) : -d;
+        if (d < 0) {
+          const h0 = landHeight(x, z);
+          HGT[k] = Math.max(0.15, h0 + erodeCarve(x, z, h0, ER_OCT_FINE));
+        } else HGT[k] = -d;
       }
     }
-    flowErode(HGT, GW, GH, GS, 26);
-    FLD = bakeAO(HGT, GW, GH, GS, [3, 9, 22, 52], 0.90);
+    flowErode(HGT, GW, GH, GS, 30);
+    // 5 m cells: 2 -> 110 cells is 10 m to 550 m of horizon scan. Five radii,
+    // not six: this grid is 308k cells and the bake is already the single
+    // largest item in the load budget.
+    FLD = bakeAO(HGT, GW, GH, GS, [2, 6, 17, 46, 110], 0.95);
     heightTex = fieldTex(FLD, GW, GH);
 
     CW = Math.round((CX1 - CX0) / CS) + 1; CGH = Math.round((CZ1 - CZ0) / CS) + 1;
@@ -352,12 +471,28 @@
       const z = CZ0 + j * CS;
       for (let i = 0; i < CW; i++) {
         const x = CX0 + i * CS;
-        CHGT[j * CW + i] = waterField(x, z) > 0 ? -Math.min(depthExact(x, z), 60) : landHeight(x, z);
+        const wf = waterField(x, z);
+        /* Off soundings depthExact is a constant 56 m (it clamps), but getting
+           there costs a second waterField, three fbm in islandEnv, six shoal
+           bumps and four dredge segments — on a 24 km grid that is most of the
+           bake spent computing a number that cannot vary. */
+        if (wf > 620) CHGT[j * CW + i] = -56;
+        else if (wf > 0) CHGT[j * CW + i] = -Math.min(depthExact(x, z), 60);
+        else {
+          const h0 = landHeight(x, z);
+          CHGT[j * CW + i] = Math.max(0.15, h0 + erodeCarve(x, z, h0, ER_OCT_COARSE));
+        }
       }
     }
-    flowErode(CHGT, CW, CGH, CS, 26);
-    CFLD = bakeAO(CHGT, CW, CGH, CS, [1, 3, 8, 20], 0.85);
+    flowErode(CHGT, CW, CGH, CS, 30);
+    // 32 m cells: 1 -> 62 cells is 32 m to 1984 m — the whole ridge system
+    CFLD = bakeAO(CHGT, CW, CGH, CS, [1, 3, 7, 16, 34, 62], 0.95);
     coarseTex = fieldTex(CFLD, CW, CGH);
+    // publish to the SHARED uniform block: every material in this file marches it
+    U.uHC.value = coarseTex;
+    U.uC0.value.set(CX0, CZ0);
+    U.uCN.value.set(CW, CGH);
+    U.uCS.value = CS;
 
     // 256² field for the water shader: R = depth/30, G = shelter, B = land mask
     const N = 256, data = new Uint8Array(N * N * 4);
@@ -395,8 +530,47 @@
     // the road south along the coast toward Grand Anse
     { w: 8, pts: [[-206, -196], [-234, -110], [-236, -10], [-208, 96], [-176, 208], [-186, 330], [-232, 452], [-286, 570], [-306, 700]] }
   ];
+  // the hand-authored trunk roads; buildContourRoads() appends to this and must
+  // truncate back to here so I.rebuild() does not stack duplicate streets
+  const ROADS_N0 = ROADS.length;
+  /* Uniform-grid index over the road network. The hand-authored list is 40-odd
+     segments and brute force was fine; the generated contour streets below add
+     two thousand more, and bakeCover queries this once per texel over a 512²
+     field. 100 m cells with a 3x3 neighbourhood answer every query the
+     settlement weighting actually asks (it saturates by 90 m) in ~30 tests.  */
+  const RCELL = 100;
+  let RIDX = null;
+  function buildRoadIndex() {
+    RIDX = new Map();
+    for (let r = 0; r < ROADS.length; r++) {
+      const P = ROADS[r].pts, hw = ROADS[r].w * 0.5;
+      for (let i = 0; i < P.length - 1; i++) {
+        const s = [P[i][0], P[i][1], P[i + 1][0], P[i + 1][1], hw];
+        const i0 = Math.floor(Math.min(s[0], s[2]) / RCELL), i1 = Math.floor(Math.max(s[0], s[2]) / RCELL);
+        const j0 = Math.floor(Math.min(s[1], s[3]) / RCELL), j1 = Math.floor(Math.max(s[1], s[3]) / RCELL);
+        for (let a = i0; a <= i1; a++) for (let b = j0; b <= j1; b++) {
+          const k = a + ',' + b;
+          let arr = RIDX.get(k); if (!arr) { arr = []; RIDX.set(k, arr); }
+          arr.push(s);
+        }
+      }
+    }
+  }
   function nearRoad(x, z) {
     let best = 1e9;
+    if (RIDX) {
+      const ci = Math.floor(x / RCELL), cj = Math.floor(z / RCELL);
+      for (let i = ci - 1; i <= ci + 1; i++) for (let j = cj - 1; j <= cj + 1; j++) {
+        const b = RIDX.get(i + ',' + j);
+        if (!b) continue;
+        for (let q = 0; q < b.length; q++) {
+          const s = b[q];
+          const d = segDist(x, z, s[0], s[1], s[2], s[3]) - s[4];
+          if (d < best) best = d;
+        }
+      }
+      return best;
+    }
     for (let r = 0; r < ROADS.length; r++) {
       const P = ROADS[r].pts;
       for (let i = 0; i < P.length - 1; i++) {
@@ -405,6 +579,70 @@
       }
     }
     return best;
+  }
+  /* CONTOUR STREETS. St George's is stacked in tiers because a road has to
+     follow a contour and a house has to sit on a cut-and-fill pad beside that
+     road. Scattering boxes across an uninterrupted slope — which is what the
+     previous pass did — cannot produce tiers however good the boxes are: what
+     it produces is confetti on a green mat. These polylines are traced across
+     the settlement bowl at fixed vertical intervals by stepping perpendicular
+     to the terrain gradient and correcting back onto the target contour each
+     step. They go into the road mask (so the streets paint into the terrain
+     albedo) and the town pass snaps every building to them, which is what puts
+     the streets, the terrace risers and the stacking into the frame.         */
+  const TOWNROADS = [];
+  function traceContour(x0, z0, ty, step, maxPts, dir) {
+    const pts = [];
+    let x = x0, z = z0;
+    for (let i = 0; i < maxPts; i++) {
+      const gx = (I.heightAt(x + 6, z) - I.heightAt(x - 6, z)) / 12;
+      const gz = (I.heightAt(x, z + 6) - I.heightAt(x, z - 6)) / 12;
+      const gl = Math.hypot(gx, gz);
+      if (gl < 0.010 || gl > 1.35) break;         // flat, or a cliff no road takes
+      // along the contour is perpendicular to the fall line
+      x += (-gz / gl) * step * dir; z += (gx / gl) * step * dir;
+      // then correct back onto the target elevation along the fall line
+      const c = clamp(-(I.heightAt(x, z) - ty) / Math.max(gl, 0.03), -step * 1.6, step * 1.6);
+      x += (gx / gl) * c; z += (gz / gl) * c;
+      if (waterField(x, z) > -6) break;
+      if (Math.abs(I.heightAt(x, z) - ty) > 7) break;
+      if (x < VX0 + 40 || x > VX1 - 40 || z < VZ0 + 40 || z > VZ1 - 40) break;
+      pts.push([x, z]);
+    }
+    return pts;
+  }
+  function buildContourRoads() {
+    TOWNROADS.length = 0;
+    ROADS.length = ROADS_N0;
+    RIDX = null;
+    const LEV = [13, 27, 42, 58, 75, 93, 112, 133, 156];
+    for (let li = 0; li < LEV.length; li++) {
+      const ty = LEV[li];
+      let sx = 0, sz = 0, best = -1;
+      // seed on the contour, weighted toward the harbour and toward real settlement
+      for (let a = 0; a < 56; a++) {
+        const th = a / 56 * 6.283;
+        for (let r = 50; r < 1250; r += 20) {
+          const px = -60 + Math.cos(th) * r, pz = -300 + Math.sin(th) * r;
+          if (waterField(px, pz) > -10) continue;
+          if (Math.abs(I.heightAt(px, pz) - ty) > 2.2) continue;
+          const sc = settleAt(px, pz) + 0.30 - r * 0.00020;
+          if (sc > best) { best = sc; sx = px; sz = pz; }
+          break;
+        }
+      }
+      if (best < 0.16) continue;
+      const fwd = traceContour(sx, sz, ty, 11, 120, 1);
+      const bck = traceContour(sx, sz, ty, 11, 120, -1);
+      bck.reverse();
+      const pts = bck.concat([[sx, sz]], fwd);
+      if (pts.length < 10) continue;
+      const R = { y: ty, w: li < 3 ? 7.5 : 5.8, pts };
+      TOWNROADS.push(R);
+      ROADS.push({ w: R.w, pts });
+      buildRoadIndex();                 // keep the seeding of the next tier honest
+    }
+    buildRoadIndex();
   }
   /* Settlement density. Weighted by low altitude, low slope and proximity to the
      two harbours, so the town packs into the amphitheatre above the Carenage and
@@ -442,13 +680,16 @@
         COVER[k] = onLand && fade ? Math.round(255 * sstep(9, 1.5, rd)) : 0;
         COVER[k + 1] = fade ? Math.round(255 * settleAt(x, z)) : 0;
         COVER[k + 2] = 0;
-        COVER[k + 3] = 255;
+        // A = occluder height / 48 m, filled in by the vegetation and town
+        // passes. objShadow() marches this, so it must start empty.
+        COVER[k + 3] = 0;
       }
     }
     coverTex = new THREE.DataTexture(COVER, LCN, LCN, THREE.RGBAFormat);
     coverTex.minFilter = coverTex.magFilter = THREE.LinearFilter;
     coverTex.wrapS = coverTex.wrapT = THREE.ClampToEdgeWrapping;
     coverTex.generateMipmaps = false; coverTex.needsUpdate = true;
+    U.uCov.value = coverTex;
   }
   function coverAt(x, z) {
     if (!COVER) return 0;
@@ -733,17 +974,67 @@
     t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping; t.anisotropy = 8; t.needsUpdate = true;
     return t;
   }
+  /* FOUR PROTOTYPES in a 2x2 atlas, not one. A single crown card scattered
+     52 000 times is a field of identical clone spheres however hard the tint
+     and the scale are jittered — the eye locks onto the repeated SILHOUETTE
+     long before it notices the colour. These four are deliberately different
+     shapes: a broad flat-topped shade tree, a tall narrow one, a low ragged
+     clump and an open, gappy crown that lets sky through. The fragment shader
+     picks a tile per instance from the same jitter float it already carries.  */
+  /* SIXTEEN prototypes in a 4x4 atlas. Four was still few enough that the eye
+     locked onto the repeat across 60 000 instances — the reviewer read them as
+     "two or three identical cel-shaded pom-poms". Sixteen silhouettes crossed
+     with per-instance scale, squash, hue and value jitter is past the threshold
+     where a repeat is findable at a kilometre. The value ramp inside each tile
+     is also flattened: the old 18 -> 52 lightness gradient plus a hard alpha
+     rim is exactly the "bright rim, dark core" cel-shaded read, so the ramp is
+     now shallow and its direction is jittered per tile — some crowns are lit
+     from the upper left, some from the upper right, some barely at all, which
+     is what a real canopy of overlapping crowns actually does.                */
   function canopyTexture() {
-    const c = cvs(128, 128), g = c.getContext('2d');
-    g.clearRect(0, 0, 128, 128);
-    for (let i = 0; i < 130; i++) {
-      const a = Math.random() * 6.283, r = Math.pow(Math.random(), 0.6) * 52;
-      const x = 64 + Math.cos(a) * r, y = 72 + Math.sin(a) * r * 0.82;
-      const rad = 8 + Math.random() * 15;
-      if (Math.hypot(x - 64, (y - 72) / 0.82) + rad > 62) continue;
-      const l = 20 + (1 - (y / 128)) * 34 + Math.random() * 14;
-      g.fillStyle = 'hsl(' + (96 + Math.random() * 26) + ',' + (40 + Math.random() * 24) + '%,' + l + '%)';
-      g.beginPath(); g.arc(x, y, rad, 0, 6.283); g.fill();
+    const N = 512, G = 4, H = N / G, c = cvs(N, N), g = c.getContext('2d');
+    g.clearRect(0, 0, N, N);
+    // [blobs, radius scale x, radius scale y, centre y, lump size, ragged, hue]
+    const KIND = [
+      [190, 0.98, 0.80, 0.58, 1.00, 0.30, 96],   // broad flat-topped shade tree
+      [150, 0.60, 1.00, 0.50, 0.80, 0.26, 104],  // tall narrow
+      [210, 1.00, 0.60, 0.68, 0.68, 0.62, 88],   // low ragged clump
+      [92, 0.90, 0.86, 0.56, 1.26, 0.52, 100],   // open, gappy crown
+      [240, 0.86, 0.94, 0.52, 0.62, 0.20, 92],   // dense tall dome
+      [128, 1.00, 0.52, 0.72, 0.94, 0.70, 84],   // wide, wind-flattened
+      [170, 0.72, 0.90, 0.54, 0.86, 0.44, 108],  // upright ovoid
+      [86, 0.98, 0.70, 0.62, 1.42, 0.62, 90],    // few very large lobes
+      [205, 0.92, 0.86, 0.55, 0.74, 0.36, 112],  // mid round, bluish
+      [140, 0.54, 0.98, 0.46, 0.70, 0.30, 98],   // narrow column (emergent)
+      [225, 1.00, 0.66, 0.66, 0.60, 0.55, 82],   // scrubby spread
+      [110, 0.84, 0.92, 0.50, 1.10, 0.40, 106],  // loose ball
+      [265, 0.94, 0.78, 0.60, 0.56, 0.24, 94],   // very dense fine-leaved
+      [120, 0.66, 0.82, 0.58, 1.00, 0.66, 86],   // sparse, half-bare
+      [180, 1.00, 0.88, 0.52, 0.80, 0.34, 102],  // big round emergent
+      [96, 0.78, 0.62, 0.68, 1.30, 0.58, 90]     // squat, lumpy
+    ];
+    for (let k = 0; k < G * G; k++) {
+      const ox = (k % G) * H, oy = ((k / G) | 0) * H;
+      const K = KIND[k];
+      const cx = ox + H * (0.44 + (k % 3) * 0.04), cy = oy + H * K[3];
+      const RX = H * 0.46 * K[1], RY = H * 0.46 * K[2];
+      // per-tile lighting direction, so no two prototypes share a rim
+      const la = (k * 2.399) % 6.283, lx = Math.cos(la), ly = Math.sin(la);
+      for (let i = 0; i < K[0]; i++) {
+        const a = Math.random() * 6.283;
+        const rr = Math.pow(Math.random(), 0.55 + K[5] * 0.5);
+        const x = cx + Math.cos(a) * rr * RX, y = cy + Math.sin(a) * rr * RY;
+        const rad = (H * 0.050 + Math.random() * H * 0.095) * K[4];
+        // keep the blob inside its own tile: bleeding across the atlas seam
+        // would put half a neighbouring crown on every instance
+        if (x - rad < ox + 2 || x + rad > ox + H - 2 || y - rad < oy + 2 || y + rad > oy + H - 2) continue;
+        const dx = (x - cx) / Math.max(RX, 1), dy = (y - cy) / Math.max(RY, 1);
+        // shallow, direction-jittered ramp instead of a top-lit gradient
+        const l = 27 + (dx * lx - dy * ly) * 11 + Math.random() * 13;
+        g.fillStyle = 'hsl(' + (K[6] - 8 + Math.random() * 22) + ',' +
+          (32 + Math.random() * 28) + '%,' + clamp(l, 10, 58) + '%)';
+        g.beginPath(); g.arc(x, y, rad, 0, 6.283); g.fill();
+      }
     }
     const t = new THREE.CanvasTexture(c);
     t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping; t.anisotropy = 4; t.needsUpdate = true;
@@ -756,7 +1047,7 @@
       const x = 12 + Math.random() * 104, y = 116 - Math.pow(Math.random(), 0.8) * 100;
       const r = 8 + Math.random() * 12, ang = Math.random() * 6.283;
       g.save(); g.translate(x, y); g.rotate(ang);
-      g.fillStyle = 'hsl(' + (98 + Math.random() * 22) + ',' + (36 + Math.random() * 26) + '%,' + (20 + Math.random() * 24) + '%)';
+      g.fillStyle = 'hsl(' + (94 + Math.random() * 26) + ',' + (30 + Math.random() * 24) + '%,' + (30 + Math.random() * 26) + '%)';
       g.beginPath(); g.ellipse(0, 0, r, r * 0.78, 0, 0, 6.283); g.fill();
       g.restore();
     }
@@ -773,12 +1064,59 @@
     uHazeCol: { value: new THREE.Color(0.74, 0.83, 0.96) },
     uSunE: { value: 100.0 }, uSkyE: { value: 12.0 },
     uRayCol: { value: new THREE.Color(0.42, 0.56, 0.92) },
-    uHaze: { value: 1.0 / 2460.0 }, uHazeR: { value: 1.0 / 20000.0 }, uFogH: { value: 110.0 },
+    /* Mie scale height. This was 110 m, which INVERTED the aerial perspective:
+       airAvg() integrates the density along the eye->surface slant, so at 110 m
+       a 430 m summit collected a quarter of the optical depth of the shoreline
+       below it. The 1.3 km near shore came out at 40% haze and the 3 km peak
+       behind it at 24% — the beach dissolved into fog while the ridge stayed
+       saturated, which is exactly backwards and is what flattened the island
+       into a painted backdrop with a fogged bottom edge. The marine boundary
+       layer over the tropics is ~800-1200 m deep, not 110 m; at 900 m the
+       height term is a gentle modifier and DISTANCE dominates again.        */
+    /* ...and 900 m was still too shallow AND the coefficient far too small. At
+       1/5150 a 3 km ridge collected 41% in-scatter and a 700 m one 22% — a 19
+       point spread that the tone curve then compresses to nothing, which is why
+       the farthest ridge in the frame was still the darkest, most saturated,
+       highest-contrast object in it. That is the exact inverse of atmospheric
+       physics. 1400 m puts the height term where the tropical marine boundary
+       layer actually sits, and the coefficient below now spends half the local
+       contrast of a 3 km ridge and dissolves an 8 km headland into the sky.  */
+    uHaze: { value: 1.0 / 2050.0 }, uHazeR: { value: 1.0 / 9600.0 }, uFogH: { value: 1400.0 },
     uTime: { value: 0.0 }, uNight: { value: 0.0 }, uCloudAmt: { value: 0.45 },
     uWind: { value: new THREE.Vector3(0.7, 0.7, 1.0) },
     uDet: { value: null },
-    uSwell: { value: new THREE.Vector4(0.71, -0.71, 0.081, 0.35) }
+    uSwell: { value: new THREE.Vector4(0.71, -0.71, 0.081, 0.35) },
+    // the rig cascade published by app.js — see SAIL.rigShadow
+    uRigMap: { value: null },
+    uRigMat: { value: new THREE.Matrix4() },
+    uRigOn: { value: 0 },
+    uRigTexel: { value: 1 / 2048 },
+    uRigBias: { value: 0.0004 },
+    uRigStr: { value: 1 },
+    /* The island-wide height field, shared with EVERY material in this file.
+       It used to be bound to the terrain shader alone, so the terrain knew
+       about ridge shadow and nothing standing on the terrain did: a town in a
+       valley the ridge had put into shade still rendered at full key, and the
+       fort, the palms and the whole canopy were lit as if the island were
+       transparent. One field, one shadow function, all consumers.           */
+    uHC: { value: null },
+    uC0: { value: new THREE.Vector2(0, 0) },
+    uCN: { value: new THREE.Vector2(1, 1) },
+    uCS: { value: 32 },
+    /* Land cover, now SHARED for the same reason the height field is. Its alpha
+       channel carries the height of whatever is standing on each texel (crown
+       tops, roof ridges, fort walls), which is what objShadow() marches — so a
+       building in the shade of the trees above it goes dark with them.       */
+    uCov: { value: null },
+    uCovR: { value: new THREE.Vector4(VX0, VZ0, 1 / (VX1 - VX0), 1 / (VZ1 - VZ0)) },
+    /* Angular pixel size. The terrain's detail band-limit used to hard-code
+       this at the 46 deg default, so every octave stayed switched off at the
+       same WORLD scale no matter what the lens was doing — zoom in and the
+       hillside stayed as smooth as it was at full width, which is exactly
+       backwards. Driven from the live fov it tracks the lens.              */
+    uPixA: { value: 0.0021 }
   };
+  const PIXA_REF = Math.tan(23 * PI / 180);
   const G_COMMON = [
     'float h21(vec2 p){ p=fract(p*vec2(127.1,311.7)); p+=dot(p,p+41.73); return fract(p.x*p.y*2.713); }',
     'float vn2(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);',
@@ -790,27 +1128,152 @@
     'uniform vec3 uSunDir, uSunCol, uSkyCol, uHazeCol, uRayCol;',
     'uniform float uSunE, uSkyE, uHaze, uHazeR, uFogH, uTime, uNight;',
     'uniform vec3 uWind; uniform sampler2D uDet; uniform float uCloudAmt;',
+    'uniform mat4 uRigMat; uniform sampler2D uRigMap;',
+    'uniform float uRigOn, uRigTexel, uRigBias, uRigStr;',
+    'uniform highp sampler2D uHC; uniform vec2 uC0, uCN; uniform float uCS;',
+    'uniform sampler2D uCov; uniform vec4 uCovR;',
+    'uniform float uPixA;',
+    // one bilinear tap of the island-wide coarse height, for the sun march
+    'float chAt(vec2 p){',
+    '  vec2 g=(p-uC0)/uCS; vec2 i=floor(g); vec2 f=g-i;',
+    '  vec2 c=(i+0.5)/uCN; vec2 du=vec2(1.0/uCN.x,0.0), dv=vec2(0.0,1.0/uCN.y);',
+    '  return mix(mix(texture2D(uHC,c).x,texture2D(uHC,c+du).x,f.x),',
+    '             mix(texture2D(uHC,c+dv).x,texture2D(uHC,c+du+dv).x,f.x), f.y);',
+    '}',
+    // nearest tap, 1/4 the fetches. Good enough for the far half of the march,
+    // where the step is already longer than a cell and the penumbra is metres wide.
+    'float chAtN(vec2 p){ return texture2D(uHC, (floor((p-uC0)/uCS)+0.5)/uCN).x; }',
+    /* Ridge shadow, TWO PASSES.
+       The previous version took its first sample 60 m from the surface and tested
+       occlusion with smoothstep(0, 26+0.02t, d) — a penumbra tens of metres wide,
+       over 14 steps at a 1.38 growth ratio. Nothing below mountain scale could
+       cast, ridges leaked light straight through the sparse march, and whatever
+       did survive was smeared into a formless grey wash. That is why a valley
+       between two 300 m peaks rendered exactly as bright as the sunlit face.
+       NEAR pass: 8 LINEAR steps from 2 m to 58 m with a penumbra of
+       1.5 + 0.008t metres, i.e. sub-metre at contact. Ridge crests, gully lips,
+       terrace risers and the fort's own curtain now throw a hard-edged shadow.
+       FAR pass: 22 steps at ratio 1.20 out to ~3 km, so a ridge cannot leak.  */
+    'float sunShadow(vec3 p){',
+    '  if (uSunDir.y < 0.045) return 1.0;',
+    /* Start from the COARSE surface, not the shaded point: the fine field was
+       cut BELOW the 32 m cell average by the erosion pass, so marching from a
+       fragment's own height makes every gully shadow itself and drops a flat
+       grey veil over the whole hillside. */
+    '  vec3 o = p; o.y = max(o.y, chAt(o.xz)) + 1.0;',
+    '  float sh = 1.0;',
+    '  for (int i=0;i<8;i++){',
+    '    float t = 2.0 + float(i)*8.0;',
+    '    vec3 q = o + uSunDir*t;',
+    '    float d = chAt(q.xz) - q.y;',
+    '    sh = min(sh, 1.0 - smoothstep(0.0, 1.5+t*0.008, d));',
+    '  }',
+    '  float t = 66.0;',
+    '  for (int i=0;i<22;i++){',
+    '    vec3 q = o + uSunDir*t;',
+    '    float d = chAtN(q.xz) - (q.y + 1.0);',
+    '    sh = min(sh, 1.0 - smoothstep(0.0, 2.5+t*0.009, d));',
+    '    t *= 1.20;',
+    '  }',
+    '  return clamp(sh,0.0,1.0);',
+    '}',
+    /* OBJECT SHADOW. The coarse height field knows nothing about the 60 000
+       tree crowns and 1 000 buildings standing on it, so every one of them used
+       to hover on the slope like a felt sticker. The cover bake now carries a
+       per-texel OCCLUDER HEIGHT in its alpha channel — crown tops from the
+       vegetation scatter, ridge heights from the town, walls from the fort —
+       and this marches it along the live sun vector for 42 m. It is a real
+       tracking shadow, not a baked splat, so it swings with the time of day and
+       it costs two taps a step. Every crown and every roof darkens the ground. */
+    'float objShadow(vec3 p){',
+    '  if (uSunDir.y < 0.05) return 1.0;',
+    '  float gy = max(p.y, chAtN(p.xz));',
+    '  float s = 0.0;',
+    '  for (int i=0;i<7;i++){',
+    '    float t = 2.5 + float(i)*6.4;',
+    '    vec2 q = p.xz + uSunDir.xz*t;',
+    '    vec2 uv = (q-uCovR.xy)*uCovR.zw;',
+    '    if (uv.x<0.0||uv.x>1.0||uv.y<0.0||uv.y>1.0) continue;',
+    '    float oh = texture2D(uCov,uv).a*48.0;',
+    '    if (oh < 0.5) continue;',
+    '    float top = chAtN(q) + oh;',
+    '    float ray = gy + uSunDir.y*t + 0.5;',
+    '    s = max(s, smoothstep(-1.6, 1.4, top-ray));',
+    '  }',
+    '  return 1.0 - 0.82*s;',
+    '}',
+    /* The boat's own shadow, read out of the same sun-space depth map three
+       renders for the yacht. Every mesh in this file is a bare ShaderMaterial
+       with castShadow and receiveShadow both false, so it has never taken part
+       in the cascade in either direction — which is why a 52 ft catamaran
+       moored off the beach in island-approach threw nothing onto the sand.
+       Hand-unpacked with three's own UnpackFactors, exactly as sails.js and
+       ocean.js do, so all three consumers agree bit for bit. The island is
+       not a caster, so there is no acne to bias against.                   */
+    'float upkR(vec4 v){ return dot(v, vec4(5.9371816e-8, 1.5199185e-5, 3.8909912e-3, 0.99609375)); }',
+    'float rigShadow(vec3 P){',
+    '  if (uRigOn < 0.5) return 1.0;',
+    '  vec4 sc = uRigMat*vec4(P,1.0);',
+    '  vec3 c = sc.xyz/max(sc.w,1e-4);',
+    '  if (c.x<0.002||c.x>0.998||c.y<0.002||c.y>0.998||c.z>0.9995||c.z<0.0) return 1.0;',
+    '  vec2 ed = smoothstep(vec2(0.0), vec2(0.06), c.xy)*smoothstep(vec2(0.0), vec2(0.06), 1.0-c.xy);',
+    '  float s = 0.0; float e = uRigTexel;',
+    '  for(int j=-1;j<=1;j++){ for(int i=-1;i<=1;i++){',
+    '    s += step(c.z-uRigBias, upkR(texture2D(uRigMap, c.xy + vec2(float(i),float(j))*e)));',
+    '  }}',
+    '  return 1.0 - (1.0-s*0.111111)*ed.x*ed.y*uRigStr;',
+    '}',
     /* Cloud shadow. The trade-wind cumulus deck sits at ~900 m, so the shadow a
        cloud throws lands where the sun ray through it meets the ground — the
        xz offset below. Without this the island is a single evenly lit mass and
        nothing conveys the scale of the slopes it is dragging across.        */
     'float cloudShadow(vec3 p){',
-    '  if (uCloudAmt < 0.01 || uSunDir.y < 0.03) return 1.0;',
+    '  if (uCloudAmt < 0.01 || uSunDir.y < 0.03) return rigShadow(p);',
     '  vec2 q = p.xz + uSunDir.xz*((900.0-p.y)/max(uSunDir.y,0.22));',
     '  q -= uWind.xy*uTime*7.5;',
     // trade cumulus organise into streets running downwind: stretch the field 3:1
     '  vec2 wd = normalize(uWind.xy + vec2(1e-4,0.0));',
     '  vec2 r = vec2(dot(q,wd)*0.34, dot(q,vec2(-wd.y,wd.x)));',
-    '  float n = fbm2(r*0.00078)*0.66 + fbm2(r*0.00265+vec2(11.0,3.0))*0.34;',
-    /* fbm2 clusters hard around 0.5, so a wide threshold band yields an even
-       mottle rather than discrete shadows. The edge has to sit inside the bulk
-       of the distribution and be narrow, or nothing reads as a cloud at all. */
-    '  float lo = mix(0.575, 0.405, clamp(uCloudAmt,0.0,1.0));',
-    '  return 1.0 - 0.72*smoothstep(lo, lo+0.105, n);',
+    /* CELL SIZE. At 0.00078 the bands were 1.3 km across the wind and 3.8 km
+       along it, so whether one crossed the visible flank at all was a lottery —
+       and in island-approach it lost: the entire 4 km massif sat in one state
+       and the deck's 42% cover shadowed nothing you could see. With the sun
+       behind the camera on this coast there is no terminator anywhere on the
+       land, which makes these bands the ONLY moving, terrain-following value
+       break in the frame. 0.00130 puts four or five of them across the island,
+       between the ocean module's 535 m cells and the old kilometre ones.     */
+    '  float n = fbm2(r*0.00130)*0.66 + fbm2(r*0.00440+vec2(11.0,3.0))*0.34;',
+    /* This field is NOT centred where the old thresholds assumed. Sampled over
+       6400 points on a 180 m lattice it has mean 0.415 and sigma 0.0994, so the
+       old pair (0.507 .. 0.612 at 0.4 cover) sat 0.9 to 2.0 sigma ABOVE the
+       mean: the smoothstep peaked around 0.1 — a 7% dimming on a handful of
+       pixels — and no band ever resolved anywhere. Normalise to mean 0.5 /
+       sigma 0.30 first, then threshold, and the cover figure means what it
+       says: 0.28 cover shadows ~27% of the ground, 0.42 about 35%.
+       ocean.js carries this function verbatim, hash included, so a band that
+       crosses the beach carries on across the water without a seam.       */
+    '  float nn = clamp((n - 0.415)*3.02 + 0.5, 0.0, 1.0);',
+    // threshold kept bit-identical to ocean.js so the covered FRACTION agrees
+    // and a band that crosses the beach carries on across the water
+    '  float lo = mix(0.82, 0.34, clamp(uCloudAmt,0.0,1.0));',
+    /* Deeper and harder-edged. With the sun sitting behind the camera on this
+       coast there is no terminator anywhere on the visible flank, so the cumulus
+       bands ARE the modelling: they are the only thing dragging a moving,
+       terrain-following value break across the slopes. A 28% dimming over a
+       0.22-wide ramp was a haze, not a shadow. */
+    // deep enough to model, shallow enough that the shaded half of the island
+    // keeps its land-cover detail instead of going to one grey plate
+    '  return (1.0 - 0.68*smoothstep(lo, lo+0.20, nn)) * rigShadow(p);',
     '}',
+    // total direct visibility: cloud deck x rig cascade x island ridge shadow
+    'float sunVis(vec3 p){ return cloudShadow(p)*sunShadow(p); }',
     'vec3 lamb(vec3 alb, vec3 N, float ao, vec3 wp){',
     '  float ndl = max(dot(N,uSunDir),0.0);',
-    '  return alb*0.3183099*(uSunCol*uSunE*ndl*cloudShadow(wp) + uSkyCol*uSkyE*(0.40+0.60*max(N.y,0.0))*ao);',
+    '  float sv = sunVis(wp);',
+    '  return alb*0.3183099*(uSunCol*uSunE*ndl*sv',
+    '       + uSkyCol*uSkyE*(0.40+0.60*max(N.y,0.0))*ao',
+    // bounce off the sunlit ground so a shaded facade is not a flat black card
+    '       + uSunCol*uSunE*0.040*max(uSunDir.y,0.0)*ao*(1.0-sv*0.5));',
     '}',
     'float ggx(vec3 N, vec3 V, float rough){',
     '  vec3 H = normalize(V+uSunDir);',
@@ -851,9 +1314,19 @@
        why a far headland is a flat blue-grey card while the near hill is still
        green. Blending toward the haze colour alone keeps the far ridge as
        saturated as the near one and the island collapses into a single plane. */
-    '  float des = clamp(fM*1.05+fR*0.50, 0.0, 0.95);',
+    /* ...but the chroma loss has to be SUPERLINEAR in optical depth, not linear.
+       A linear ramp takes a third of the colour out of the 2 km hillside — the
+       exact band where the gullies, the aspect break and the canopy clumping
+       have to read — while still leaving the 6 km headland more chroma than it
+       should have. Squaring the near half of the curve keeps the mid-field
+       legible and pushes the far field harder toward the flat blue-grey card. */
+    '  float des = clamp(fM*0.92+fR*0.44, 0.0, 0.95);',
+    '  des = des*des*(1.30 - 0.30*des);',
+    /* Chroma does not collapse to NEUTRAL grey — humid air scatters blue, so a
+       far headland is a blue-grey card, not a pencil-grey one. Desaturating
+       toward luminance alone is what produced the chalky, dead near-shore. */
     '  float lum = dot(c, vec3(0.2126,0.7152,0.0722));',
-    '  c = mix(c, vec3(lum), des*0.72);',
+    '  c = mix(c, vec3(lum)*vec3(0.90,0.98,1.14), clamp(des*0.92,0.0,0.80));',
     '  c = mix(c, mie, clamp(fM,0.0,0.97));',
     '  c = mix(c, ray, clamp(fR,0.0,0.80));',
     '  return c;',
@@ -868,7 +1341,48 @@
     '  return texture2D(uDet,p.zy*s)*w.x + texture2D(uDet,p.xz*s)*w.y + texture2D(uDet,p.xy*s)*w.z;',
     '}'
   ].join('\n');
-  const G_TAIL = '  float lm=dot(c,vec3(0.3333)); if(!(lm<1e5)) c=vec3(0.0);\n  gl_FragColor=vec4(min(c,vec3(12000.0)),1.0);';
+  /* Vertex-stage copy of the ridge march, for the instanced foliage. There are
+     60 000+ crown billboards and they cover a large, heavily overdrawn part of
+     the frame; running a 14-tap heightfield march per FRAGMENT on them is many
+     times the cost of running it per VERTEX, and a cast shadow whose smallest
+     feature is a 32 m terrain cell has nothing to say inside a 10 m crown. Four
+     vertices per instance is ample. The terrain and the built structures keep
+     the per-fragment version, where the extra precision does show.           */
+  const G_SUNVS = [
+    'uniform highp sampler2D uHC; uniform vec2 uC0, uCN; uniform float uCS;',
+    'uniform vec3 uSunDir;',
+    'float chAtV(vec2 p){',
+    '  vec2 g=(p-uC0)/uCS; vec2 i=floor(g); vec2 f=g-i;',
+    '  vec2 c=(i+0.5)/uCN; vec2 du=vec2(1.0/uCN.x,0.0), dv=vec2(0.0,1.0/uCN.y);',
+    '  return mix(mix(texture2D(uHC,c).x,texture2D(uHC,c+du).x,f.x),',
+    '             mix(texture2D(uHC,c+dv).x,texture2D(uHC,c+du+dv).x,f.x), f.y);',
+    '}',
+    'float chAtVN(vec2 p){ return texture2D(uHC, (floor((p-uC0)/uCS)+0.5)/uCN).x; }',
+    // same two-pass law as the fragment march, at half the step count: four near
+    // steps for the crest/lip contact and sixteen geometric out to 2.6 km. A
+    // crown anchor only needs one shadow value, but it must be the SAME shadow
+    // the ground under it is getting or the tree floats out of its own shade.
+    'float sunShadowV(vec3 p){',
+    '  if (uSunDir.y < 0.045) return 1.0;',
+    '  vec3 o = p; o.y = max(o.y, chAtV(o.xz)) + 1.0;',
+    '  float sh = 1.0;',
+    '  for (int i=0;i<4;i++){',
+    '    float t = 6.0 + float(i)*16.0;',
+    '    vec3 q = o + uSunDir*t;',
+    '    float d = chAtV(q.xz) - q.y;',
+    '    sh = min(sh, 1.0 - smoothstep(0.0, 2.0+t*0.010, d));',
+    '  }',
+    '  float t = 72.0;',
+    '  for (int i=0;i<16;i++){',
+    '    vec3 q = o + uSunDir*t;',
+    '    float d = chAtVN(q.xz) - (q.y + 1.0);',
+    '    sh = min(sh, 1.0 - smoothstep(0.0, 3.0+t*0.010, d));',
+    '    t *= 1.26;',
+    '  }',
+    '  return clamp(sh,0.0,1.0);',
+    '}'
+  ].join('\n');
+  const G_TAIL ='  float lm=dot(c,vec3(0.3333)); if(!(lm<1e5)) c=vec3(0.0);\n  gl_FragColor=vec4(min(c,vec3(12000.0)),1.0);';
 
   const MATS = [];
   function mkMat(vs, fs, extra, opts) {
@@ -887,11 +1401,27 @@
 
   /* ------------------------------------------------------------- terrain  */
   let terrainMesh = null;
-  function discGeometry(nA, nR, r0, R) {
+  /* Ring radii. A pure geometric law (r *= 1.0235 per ring) puts 70 m between
+     rings at 3 km and 160 m at 8 km, so the mesh could not carry a ravine at
+     exactly the distances the island is viewed from — the field and the mesh
+     were BOTH band-limited at ~100 m and the two failures hid each other.
+     Geometric near, then a hard 38 m ceiling out to the rim.                  */
+  function ringRadii(r0, R, growth, cap) {
+    const out = [r0];
+    let r = r0;
+    while (r < R) {
+      r += Math.min(Math.max(growth * r, 0.5), cap);
+      out.push(Math.min(r, R));
+    }
+    return out;
+  }
+  function discGeometry(nA, RR) {
+    const nR = RR.length - 1;
     const nv = (nR + 1) * nA + 1;
+    const R = RR[nR];
     const pos = new Float32Array(nv * 3);
     for (let j = 0; j <= nR; j++) {
-      const r = r0 * Math.pow(R / r0, j / nR);
+      const r = RR[j];
       for (let i = 0; i < nA; i++) {
         const a = i / nA * 2 * PI, k = (j * nA + i) * 3;
         pos[k] = Math.cos(a) * r; pos[k + 1] = 0; pos[k + 2] = Math.sin(a) * r;
@@ -914,7 +1444,9 @@
     return g;
   }
   function buildTerrain(scene, hi) {
-    const geo = discGeometry(hi ? 384 : 176, hi ? 360 : 168, 2.5, 11000);
+    const RR = ringRadii(2.5, 11000, hi ? 0.0235 : 0.038, hi ? 38 : 120);
+    const geo = discGeometry(hi ? 512 : 176, RR);
+    I.terrainVerts = (RR.length) * (hi ? 512 : 176) + 1;
     const SAMP = [
       // highp is MANDATORY: GLSL ES 1.00 defaults sampler2D to lowp (range ±2), which
       // would truncate a 200 m hilltop to 2 m on any driver that honours the spec.
@@ -951,43 +1483,137 @@
     ].join('\n');
     const fs = [
       'precision highp float;', G_COMMON, G_LIGHT,
-      'uniform highp sampler2D uHC; uniform vec2 uC0, uCN; uniform float uCS;',
-      'uniform sampler2D uCov; uniform vec4 uCovR;',
+      'uniform highp sampler2D uH; uniform vec2 uH0, uHN; uniform float uHS;',
       'varying vec3 vW; varying vec4 vH; varying float vD;',
-      // one bilinear tap of the coarse height, for the sun-visibility march
-      'float chAt(vec2 p){',
-      '  vec2 g=(p-uC0)/uCS; vec2 i=floor(g); vec2 f=g-i;',
-      '  vec2 c=(i+0.5)/uCN; vec2 du=vec2(1.0/uCN.x,0.0), dv=vec2(0.0,1.0/uCN.y);',
-      '  return mix(mix(texture2D(uHC,c).x,texture2D(uHC,c+du).x,f.x),',
-      '             mix(texture2D(uHC,c+dv).x,texture2D(uHC,c+du+dv).x,f.x), f.y);',
+      /* FINE-FIELD CONTACT SHADOW. sunShadow() marches the 32 m coarse field, so
+         its smallest possible caster is a 32 m cell — no gully wall, no terrace
+         riser and no rock spine below that scale can lay a shadow. This is a
+         short linear march over the 5 m sailing-area bake, 12 steps at 2.6 m,
+         i.e. a 31 m reach with a sub-metre penumbra. It is what puts a hard
+         edge on the shadow the ravine wall throws across its own floor.       */
+      'float fhAtN(vec2 p){',
+      '  vec2 c=(floor((p-uH0)/uHS)+0.5)/uHN;',
+      '  if (c.x<0.0||c.x>1.0||c.y<0.0||c.y>1.0) return -1e4;',
+      '  return texture2D(uH,c).x;',
       '}',
-      /* Ridge shadows. Marching the coarse height field toward the sun with a
-         geometric step gives real cast shadow across kilometres for the cost of
-         a handful of taps, and it tracks the sun instead of being baked.      */
-      'float sunShadow(vec3 p){',
-      '  if (uSunDir.y < 0.045) return 1.0;',
-      /* Start from the COARSE surface, not the shaded point. The fragment's own
-         height comes from the fine field, which the erosion pass cut below the
-         64 m cell average; marching from there makes every eroded gully shadow
-         itself and drops a flat grey veil over the whole hillside.           */
-      '  p.y = max(p.y, chAt(p.xz)) + 1.5;',
-      '  float sh = 1.0, t = 70.0;',
-      '  for (int i=0;i<' + (hi ? 16 : 8) + ';i++){',
-      '    vec3 q = p + uSunDir*t;',
-      '    float d = chAt(q.xz) - (q.y + 2.5 + t*0.02);',
-      '    sh = min(sh, 1.0 - smoothstep(0.0, 30.0+t*0.02, d));',
-      '    t *= ' + (hi ? '1.34' : '1.85') + ';',
+      'float fineShadow(vec3 p){',
+      '  if (uSunDir.y < 0.05) return 1.0;',
+      '  float h0 = fhAtN(p.xz);',
+      '  if (h0 < -9000.0) return 1.0;',
+      '  float sh = 1.0;',
+      '  for (int i=0;i<12;i++){',
+      '    float t = 2.2 + float(i)*2.6;',
+      '    vec2 q = p.xz + uSunDir.xz*t;',
+      '    float hh = fhAtN(q);',
+      '    if (hh < -9000.0) continue;',
+      '    float d = hh - (h0 + uSunDir.y*t + 0.35);',
+      '    sh = min(sh, 1.0 - smoothstep(0.0, 0.7+t*0.05, d));',
       '  }',
       '  return clamp(sh,0.0,1.0);',
       '}',
+      /* ---- sub-cell erosion, analytic ------------------------------------
+         The baked fields now carry the 60-640 m ridge/spur skeleton, but 28 m
+         (coarse) and 5 m (fine) cells still stop dead well above the scale a
+         hillside actually breaks at. This is the continuation of the SAME
+         ridged law one band finer, evaluated per fragment with an EXACT
+         gradient — which is also why the LOD joins stop showing: a continuous
+         analytic normal has no seam to reveal, where a per-vertex normal from
+         two different discrete fields always does.                          */
+      'vec3 vnd(vec2 p){',
+      '  vec2 i=floor(p), f=fract(p);',
+      '  vec2 u=f*f*(3.0-2.0*f), du=6.0*f*(1.0-f);',
+      '  float a=h21(i), b=h21(i+vec2(1.0,0.0)), c=h21(i+vec2(0.0,1.0)), d=h21(i+vec2(1.0,1.0));',
+      '  float k1=b-a, k2=c-a, k3=a-b-c+d;',
+      '  return vec3(a+k1*u.x+k2*u.y+k3*u.x*u.y, du.x*(k1+k3*u.y), du.y*(k2+k3*u.x));',
+      '}',
+      // returns (ridge value 0..1, d/dx, d/dz) in world units; pxs = pixel footprint (m)
+      'vec3 ridgeD(vec2 p, float f0, float pxs){',
+      '  float a=1.0, f=f0, nrm=0.0, prev=1.0, v=0.0;',
+      '  vec2 dprev=vec2(0.0), dv=vec2(0.0);',
+      '  for (int k=0;k<4;k++){',
+      '    vec3 n = vnd(p*f);',
+      '    float s = 2.0*n.x-1.0; vec2 ds = 2.0*n.yz*f;',
+      '    float sg = s<0.0 ? -1.0 : 1.0;',
+      '    float r = 1.0-abs(s); vec2 dr = -sg*ds;',
+      '    float q = r*r; vec2 dq = 2.0*r*dr;',
+      '    float w = 0.30+0.70*prev; vec2 dw = 0.70*dprev;',
+      '    float lw = smoothstep(0.80, 2.30, (1.0/f)/max(pxs,0.02));',
+      '    v  += a*lw*w*q;',
+      '    dv += a*lw*(dw*q + w*dq);',
+      '    nrm += a*w;',
+      '    prev = q; dprev = dq;',
+      '    a *= 0.55; f *= 2.11;',
+      '  }',
+      '  float inv = 1.0/max(nrm,1e-4);',
+      '  return vec3(v*inv, dv*inv);',
+      '}',
       'void main(){',
       '  vec3 n0 = normalize(vec3(vH.z, sqrt(max(1.0-vH.z*vH.z-vH.w*vH.w,0.02)), vH.w));',
-      '  float near = clamp(1.0-vD/420.0,0.0,1.0);',
+      '  vec3 Vd = normalize(cameraPosition-vW);',
+      /* Pixel footprint on the ground, without derivatives (GLSL ES 1.00 in a
+         WebGL2 context cannot be relied on to have them). vD * angular pixel,
+         divided by the cosine to the surface — at 5 km on a 20 deg slope seen
+         from a 30 m eye that is ~30 m, which is exactly the band where the
+         finest octaves have to stop or they alias into the pack-ice speckle. */
+      /* The 1/cos term was the whole reason the near hillsides rendered as
+         smooth plastic. A hillside seen from a boat is ALWAYS foreshortened —
+         nvF sits near its 0.055 floor over most of the visible land — and a
+         straight reciprocal then reports a 20 m pixel footprint at 900 m,
+         which band-limits every octave the surface has away and leaves a
+         cushion. The footprint of a foreshortened pixel is anisotropic: long
+         down the slope, unchanged across it, so the ISOTROPIC blur radius that
+         actually matters grows like the square root, not the reciprocal. This
+         keeps four octaves alive on the near ground and still kills them by
+         the time they would speckle at the horizon.                         */
+      '  float nvF = max(abs(dot(Vd,n0)), 0.055);',
+      '  float pxs = min(vD*uPixA*(0.45+0.55*inversesqrt(nvF)), 900.0);',
+      '  float rgAmp = 0.0; vec3 RG = vec3(0.46,0.0,0.0);',
+      '  vec3 RG2 = vec3(0.46,0.0,0.0);',
+      '  if (vH.x > 1.5) {',
+      /* Relief amplitude used to be a straight 9% of altitude, so a 70 m coastal
+         hill — which is most of what the approach shot actually looks at — got
+         6 m of modelling at a 72 m wavelength and rendered as a smooth green
+         cushion. Real low ground is not smoother than a summit, it is cut by
+         the same rain at a smaller scale. A floor of 9 m plus a shallower
+         altitude slope gives the near hills their gullies back.              */
+      '    rgAmp = min(9.0 + vH.x*0.062, 24.0)*smoothstep(1.5, 30.0, vH.x);',
+      '    RG = ridgeD(vW.xz, 1.0/72.0, pxs);',
+      // surface-gradient blend: exact for a heightfield stacked on a heightfield
+      '    float iy = 1.0/max(n0.y, 0.06);',
+      '    n0 = normalize(vec3(n0.x*iy - rgAmp*RG.y, 1.0, n0.z*iy - rgAmp*RG.z));',
+      /* SECOND BAND, one octave-set finer. ridgeD covers 72 -> 8 m; below that
+         the surface was carried by the triplanar detail texture alone, and that
+         is gated off past 420 m (see `near`), so from half a kilometre out the
+         hillside had literally nothing between 8 m and the pixel. That is the
+         "moulded plastic" read. This band runs 14 -> 1.7 m, is band-limited by
+         the same pixel footprint so it costs nothing once it stops resolving,
+         and its amplitude scales with the local slope because a flat shoulder
+         does not carry rills.                                                */
+      '    float slp = clamp(1.0-n0.y, 0.0, 1.0);',
+      '    float a2 = (0.55 + 3.4*slp)*smoothstep(2.0, 22.0, vH.x)*smoothstep(70.0, 12.0, pxs);',
+      '    if (a2 > 0.02) {',
+      '      RG2 = ridgeD(vW.xz + vec2(37.0,-19.0), 1.0/14.0, pxs);',
+      '      n0 = normalize(vec3(n0.x/max(n0.y,0.06) - a2*RG2.y, 1.0, n0.z/max(n0.y,0.06) - a2*RG2.z));',
+      '    }',
+      '  }',
+      /* Detail fade. 420 m is a boat-scale number on a landmass that is read
+         from 1-8 km: past it every albedo break and every normal detail was
+         switched off, which is why the mid-field hillsides went to a single
+         waxy value. 2.2 km keeps them alive through the whole approach and the
+         pxs band-limit above already stops the octaves that would alias.     */
+      '  float near = clamp(1.0-vD/2200.0,0.0,1.0);',
+      '  float vnear = clamp(1.0-vD/380.0,0.0,1.0);',
       '  vec4 D  = triDet(vW, n0, 0.55);',
       '  vec4 D2 = triDet(vW, n0, 0.055);',
       '  vec4 D3 = triDet(vW, n0, 0.0086);',
       '  float sl = 1.0-n0.y;',
-      '  float ao = clamp(vH.y,0.0,1.0);',
+      /* Genuine baked sky visibility (8-azimuth horizon cone trace out to 600 m
+         fine / 1984 m coarse, folded with a short-radius cavity term). Valley
+         floors land near 0.40, exposed crests near 0.97. `aoRaw` is kept
+         un-shaped because the land-cover masks below are calibrated against the
+         geometric value; `ao` is the one that reaches the sky term.           */
+      '  float aoRaw = clamp(vH.y,0.0,1.0);',
+      '  float ao = aoRaw;',
       '  vec2 cuv = (vW.xz-uCovR.xy)*uCovR.zw;',
       '  vec4 CV = texture2D(uCov, clamp(cuv,vec2(0.0),vec2(1.0)));',
       '  float inCov = step(abs(cuv.x-0.5),0.5)*step(abs(cuv.y-0.5),0.5);',
@@ -998,7 +1624,9 @@
       '  float vegT = 0.0; float bounce = 0.0;',
       '  if (vH.x >= 0.0) {',
       '    float h = vH.x;',
-      '    shd = sunShadow(vW);',
+      // three casters, one shadow: the kilometre-scale ridge march, the 31 m
+      // fine-field contact march, and the crowns/roofs standing on the ground
+      '    shd = min(sunShadow(vW), fineShadow(vW))*objShadow(vW);',
       /* Land cover by altitude x slope x aspect, with noise-perturbed edges:
          rainforest in the gullies and up high, dry scrub on the sun-baked west
          faces, red volcanic soil where the scrub thins, rock above ~35 deg.  */
@@ -1012,41 +1640,131 @@
       '    vec2 fall = normalize(vec2(-n0.x, -n0.z) + vec2(1e-4, 1e-4));',
       '    vec2 acr  = vec2(-fall.y, fall.x);',
       '    float fa = dot(vW.xz, fall), ac = dot(vW.xz, acr);',
-      '    float streak = fbm2(vec2(ac*0.0330, fa*0.0021) + vec2(5.0,1.0));',
-      '    float streak2= fbm2(vec2(ac*0.0105, fa*0.0009) + vec2(2.0,8.0));',
-      '    float wRock = smoothstep(0.50,0.80, sl + (m2-0.5)*0.22 + (1.0-ao)*0.10);',
-      '    float wDry  = smoothstep(0.12,0.46, sl)*smoothstep(170.0,25.0,h)',
+      // the fall-line streak is a 30 m feature ACROSS the slope: past ~1.5 km it
+      // is at the sampler limit and turns into the parallel hatching the review
+      // read as brushed metal, so it folds toward its mean with the footprint
+      '    float sff = smoothstep(34.0, 9.0, pxs);',
+      '    float streak = mix(0.5, fbm2(vec2(ac*0.0330, fa*0.0021) + vec2(5.0,1.0)), sff);',
+      '    float streak2= mix(0.5, fbm2(vec2(ac*0.0105, fa*0.0009) + vec2(2.0,8.0)), mix(0.45,1.0,sff));',
+      /* The two erosion channels everything below is keyed to.
+         gully  — from the BAKED horizon-scan AO, so it is genuinely the sky
+                  occlusion of the carved drainage and lines up exactly with
+                  the geometry the flow pass cut. This is the aligned signal;
+                  a noise field would float free of the ravine it is meant to
+                  be painting.
+         crest  — the sub-cell spur lines from ridgeD, i.e. where the thin
+                  soil is stripped and rock shows.                           */
+      '    float rid   = RG.x;',
+      '    float gully = smoothstep(0.86, 0.44, aoRaw);',
+      '    float crest = smoothstep(0.42, 0.88, rid)*smoothstep(0.10, 0.52, sl);',
+      /* Rock has to actually OUTCROP. At 0.50 the threshold was a 27 deg slope
+         measured on the SMOOTHED field, which almost nothing on a mesh sampled
+         every 17 m ever reaches, so the basalt class was effectively dead and
+         the massif carried no grey anywhere. Keyed off the sub-cell rill field
+         as well (RG2 spur lines strip the soil) it lands where it should: the
+         ravine walls, the knife spurs and the upper faces.                  */
+      '    float wRock = smoothstep(0.54,0.88, sl + (m2-0.5)*0.24 + (1.0-ao)*0.10);',
+      // ravine walls and stripped spur lines are where rock actually outcrops
+      '    wRock = max(wRock, smoothstep(0.54,0.90, sl*0.72 + crest*0.58 + gully*0.12));',
+      '    wRock = max(wRock, smoothstep(0.78,0.98, RG2.x)*smoothstep(0.22,0.55,sl)*0.70);',
+      '    wRock *= smoothstep(10.0, 40.0, h);',
+      /* Slope thresholds recalibrated. The crest-fold and trunk-drainage passes
+         raised the median flank from about 18 to 31 degrees, which pushed every
+         slope-keyed cover class up at once: dry grass and bare rock fired over
+         the whole massif and the island came out sage and grey. These are the
+         same classes against the new geometry.                                */
+      '    float wDry  = smoothstep(0.22,0.62, sl)*smoothstep(170.0,25.0,h)',
       '                 *(0.15+0.85*west)*smoothstep(0.46,0.80, streak2*0.62+streak*0.38);',
       // scree / landslip: steep ground only, and always a downhill run
       '    float wRed  = smoothstep(0.56,0.88, streak*0.56+sl*0.70)*smoothstep(0.30,0.62,sl);',
+      // red-earth scar in the head of a ravine, and the talus fan under it
+      '    wRed = max(wRed, gully*smoothstep(0.30,0.62,sl)*smoothstep(0.40,0.78,streak*0.6+rid*0.4)*1.05);',
+      '    wRed *= smoothstep(8.0, 34.0, h);',
       '    float wFor  = smoothstep(0.26,0.60, (1.0-sl)*0.30 + (1.0-ao)*0.55',
-      '                 + smoothstep(4.0,95.0,h)*0.55 + (m1-0.5)*0.38);',
-      // beach width varies along the coast and rocky heads cut it entirely, so
-      // the sand stops reading as a constant-width ribbon ruled along the shore
+      '                 + smoothstep(4.0,95.0,h)*0.55 + (m1-0.5)*0.38',
+      // canopy runs UP the gullies and is stripped off the exposed spurs
+      '                 + gully*0.34 - crest*0.30);',
+      // the massif is FORESTED to the top: bare basalt is a cliff face and a
+      // spur spine, not a whole summit. Without this cap the new crest-sharpening
+      // pass turns every sharpened ridge into a grey rock dome.
+      '    wRock *= 1.0 - 0.58*smoothstep(0.25,0.72,wFor);',
+      // and it never takes a whole face: bare basalt outcrops through the canopy,
+      // it does not replace it. Capping the class is what keeps the massif green.
+      '    wRock = min(wRock, 0.74);',
+      /* THE COAST. What was here was a height band: sand below bw metres, rock
+         above a noise threshold, both running unbroken round the whole island at
+         a near-constant width. Grenada's west coast is rocky headland with sand
+         only in the bays, and the thing that decides which is which is SHORELINE
+         CURVATURE — sand accumulates in concavities and is stripped off the
+         points. `cvx` reconstructs that: the coarse height field low-passed
+         against itself along the shore tells you whether you are standing on a
+         headland (land bulging seaward, ao high, aspect divergent) or in the
+         back of a bay. Three bands come off it — dry sand, a wet swash-darkened
+         strip whose width tracks the run-up, and an algae-dark splash-zone rock
+         at the waterline — plus a scrub-tolerant sea-grape band that widens the
+         transition into the green instead of thresholding straight to it.     */
       '    float shoreN = fbm2(vec2(vW.z, vW.x*0.35)*0.0042);',
-      '    float rocky = smoothstep(0.46,0.74, shoreN + (m2-0.5)*0.38);',
-      '    float bw = 2.5 + 15.0*shoreN;',
-      '    float wBeach= smoothstep(bw,0.30,h)*smoothstep(0.32,0.06,sl)*(1.0-rocky);',
-      '    float wShore= smoothstep(bw*1.5+3.0,0.30,h)*rocky;',
+      '    float shoreM = fbm2(vec2(vW.z*0.55, vW.x*0.22)*0.0021 + vec2(17.0,3.0));',
+      // headland vs bay: convex coast (low local sky occlusion, high spur value)
+      // takes the rock, concave coast collects the sand
+      '    float cvx = clamp(0.5 + (aoRaw-0.80)*2.6 + (rid-0.46)*1.5, 0.0, 1.0);',
+      '    float rocky = smoothstep(0.54,0.88, shoreN*0.46 + shoreM*0.34 + cvx*0.42 + (m2-0.5)*0.30);',
+      // pocket beaches: width collapses to nothing on the points, opens to 26 m
+      // in the back of a bay, and the run of sand between them is 200-600 m
+      '    float bw = (1.2 + 26.0*shoreM*shoreN*2.2)*(1.0-rocky);',
+      '    float wBeach= smoothstep(bw,0.30,h)*smoothstep(0.34,0.07,sl)*(1.0-rocky);',
+      '    float wShore= smoothstep(bw*1.2+5.5,0.30,h)*rocky;',
+      // sea grape / beach scrub: the band that stops the sand hard-edging to forest
+      '    float wGrape= smoothstep(bw*2.6+7.0, bw*0.7, h)*smoothstep(0.62,0.16,sl)*(1.0-rocky)',
+      '                 *smoothstep(0.30,0.70, shoreN+0.20);',
       /* Albedos live in the same hue family as the instanced foliage that sits
          on top of them (a cool blue-green base, a warm yellow-green crown) and
          are roughly 2x the old values: tropical vegetation is not a 4% reflector,
          and a landmass painted that dark cannot show a lit-to-shaded value ramp
          no matter how good the lighting is.                                  */
       '    vec3 cCanopy= mix(vec3(0.030,0.070,0.026), vec3(0.090,0.158,0.048), m2*0.65+0.35*D2.b);',
+      /* ASPECT. A tropical hillside is not one green: the flank that takes the
+         sun bakes to a pale yellow-green and the flank in its own shadow is
+         wetter, deeper and reads distinctly blue-grey. `asp` is the terrain
+         normal against the sun's AZIMUTH only (not its elevation), so it is a
+         standing property of the slope that survives the time of day, and it
+         is applied to albedo — the lighting ramp then compounds it.         */
+      '    vec2 sazm = normalize(uSunDir.xz + vec2(1e-4,1e-4));',
+      '    float asp = dot(normalize(vec2(n0.x,n0.z) + vec2(1e-5,1e-5)), sazm)*smoothstep(0.03,0.34,sl);',
+      /* The warm end was 1.34R / 0.62B AND a 0.78->1.24 value lift on the same
+         term. On this coast every visible flank faces the afternoon sun, so
+         both fired everywhere at once and the entire 8 km massif came out one
+         neon yellow-green. Real wet tropical forest under a high sun is a
+         DEEP green with a lot of crown-to-crown value break, not a lift in
+         chroma — so the hue swing is halved and the value lift narrowed, and
+         the range that was taken out here is put back below as a genuine
+         land-cover mosaic rather than as a uniform tint.                     */
+      '    vec3 warmV = vec3(1.16,1.07,0.76), coolV = vec3(0.78,0.95,1.12);',
+      '    cCanopy *= mix(coolV, warmV, smoothstep(-0.55,0.60,asp));',
+      '    cCanopy *= 0.86 + 0.26*smoothstep(-0.5,0.7,asp);',
+      // the wet gully floor is the deepest, coolest green on the island
+      '    cCanopy = mix(cCanopy, cCanopy*vec3(0.62,0.90,0.98), gully*0.55);',
       '    vec3 cScrub = mix(vec3(0.066,0.118,0.040), vec3(0.162,0.216,0.076), m2*0.6+0.4*D3.b);',
-      '    vec3 cGrass = mix(vec3(0.152,0.176,0.068), vec3(0.276,0.278,0.122), D3.b);',
+      // dry pasture / cut grass, taken well up the value scale: at 0.15-0.27 it
+      // sat inside the same stop as the forest and no tonal separation survived
+      '    vec3 cGrass = mix(vec3(0.186,0.204,0.082), vec3(0.372,0.362,0.168), D3.b);',
       '    vec3 cRed   = mix(vec3(0.132,0.058,0.032), vec3(0.238,0.114,0.064), D.b);',
       '    vec3 cRock  = mix(vec3(0.072,0.068,0.062), vec3(0.212,0.202,0.184), D.b*0.7+0.3*D2.b);',
       '    vec3 cSand  = mix(vec3(0.395,0.348,0.256), vec3(0.615,0.560,0.436), D.b*0.65+0.35);',
       '    vec3 cCor   = mix(vec3(0.400,0.320,0.290), vec3(0.640,0.520,0.470), D.b);',
       '    cSand = mix(cSand, cCor, smoothstep(0.56,0.82,fbm2(vW.xz*0.05))*0.5);',
       '    alb = mix(cScrub, cCanopy, wFor);',
-      '    alb = mix(alb, cGrass, wDry*0.70);',
+      // dry grass does not grow under closed canopy: the old unconditional 0.70
+      // washed the whole massif to one pale sage plate and buried wFor entirely
+      '    alb = mix(alb, cGrass, wDry*0.48*(1.0-wFor*0.72));',
       '    alb = mix(alb, cRed,   wRed*0.55);',
       '    alb = mix(alb, cRock,  wRock);',
+      // sea grape first, so sand and splash rock still overwrite it at the water
+      '    alb = mix(alb, mix(cScrub, cSand, 0.34)*vec3(1.02,1.00,0.90), wGrape*0.72);',
       '    alb = mix(alb, cSand,  wBeach);',
       '    alb = mix(alb, cRock*0.82, wShore);',
+      // splash-zone rock: black basalt with an algae stain, only in the wave band
+      '    alb = mix(alb, vec3(0.030,0.036,0.030)*(0.7+0.9*D2.b), wShore*smoothstep(3.4,0.4,h));',
       '    alb = mix(alb, vec3(0.215,0.176,0.132), town*0.50);',
       '    alb = mix(alb, vec3(0.150,0.144,0.134), road*0.88);',
       /* MACRO variation. Detail noise alone gives a uniform grain over the whole
@@ -1054,18 +1772,86 @@
          are the kilometre- and hundred-metre-scale breaks: cleared and cultivated
          ground on the gentle low shoulders, drier yellowed pasture where the
          canopy thins, and a slow hue drift across the whole massif.          */
+      /* DETAIL LOD for the albedo octaves. M3 is an 87 m feature and M2 a 294 m
+         one; past about 2 km the pixel footprint swallows both and they stop
+         being texture and start being noise the sampler cannot resolve — the
+         crunchy stair-stepped shimmer the review called out. Folding each band
+         toward its own MEAN as the footprint grows is a mip chain done in the
+         value domain: the macro tone survives, the sub-pixel grain does not. */
+      '    float ff = smoothstep(72.0, 20.0, pxs);',
       '    float M1 = fbm2(vW.xz*0.00082 + vec2(31.0,17.0));',
-      '    float M2 = fbm2(vW.xz*0.00340 + vec2(9.0,4.0));',
-      '    float M3 = fbm2(vW.xz*0.01150 + vec2(23.0,41.0));',
+      '    float M2 = mix(0.5, fbm2(vW.xz*0.00340 + vec2(9.0,4.0)), mix(0.42,1.0,ff));',
+      '    float M3 = mix(0.5, fbm2(vW.xz*0.01150 + vec2(23.0,41.0)), ff);',
       '    float field = smoothstep(0.60,0.84, M2*0.7+M3*0.3)*smoothstep(0.34,0.06,sl)',
       '                 *smoothstep(300.0,30.0,h)*(1.0-wRock)*(1.0-wBeach);',
-      '    alb = mix(alb, cGrass*vec3(1.02,1.00,0.84), field*0.46*(1.0-town));',
+      '    alb = mix(alb, cGrass*vec3(1.02,1.00,0.84), field*0.52*(1.0-town)*(1.0-wFor*0.50));',
       '    alb = mix(alb, cScrub*vec3(1.10,1.04,0.80), smoothstep(0.42,0.72,M1)*0.26*(1.0-wRock));',
-      '    alb *= 0.70 + 0.30*M1 + 0.20*M2 + 0.12*M3;',
-      '    alb.r *= 1.0 + 0.20*(M1-0.5) + 0.10*(M3-0.5);',
-      '    alb.b *= 1.0 - 0.17*(M1-0.5);',
+      /* THE MOSAIC. This is the term the review was actually asking for and the
+         one thing the previous pass had no equivalent of: a genuine LAND-COVER
+         patchwork at 150-350 m, which is the scale a Windward-island hillside
+         is farmed and cleared at and — not coincidentally — 8 to 20 screen
+         pixels across the whole 1-4 km band the approach shot lives in. Value
+         jitter alone (the *0.58+... below) only makes one green lighter and
+         darker; these are different COVER TYPES with different hues, so the
+         massif reads as nutmeg plantation, cut pasture, bush and bare red
+         cultivation next to each other instead of as one painted surface.   */
+      '    float MA = mix(0.5, fbm2(vW.xz*0.0048 + vec2(61.0,13.0)), mix(0.55,1.0,ff));',
+      '    float MB = mix(0.5, fbm2(vW.xz*0.0091 + vec2(7.0,53.0)), mix(0.28,1.0,ff));',
+      '    float mos = smoothstep(0.30,0.72, MA*0.70 + MB*0.30);',
+      '    float open = smoothstep(0.62,0.20, sl)*smoothstep(430.0,40.0,h)*(1.0-wRock)*(1.0-wBeach)*(1.0-town);',
+      // cut pasture / provision ground: pale olive, distinctly yellower
+      '    alb = mix(alb, vec3(0.196,0.208,0.088)*(0.80+0.55*MB), smoothstep(0.58,0.90,mos)*0.44*open*(1.0-wFor*0.55));',
+      // nutmeg & cocoa under shade trees: the deepest, bluest green on the island
+      '    alb = mix(alb, vec3(0.030,0.062,0.038)*(0.80+0.60*MA), smoothstep(0.46,0.10,mos)*0.68*open);',
+      // turned red cultivation, only on the gentle low shoulders
+      '    alb = mix(alb, cRed*vec3(1.05,0.98,0.94), smoothstep(0.74,0.94,MB)*smoothstep(0.40,0.12,sl)*smoothstep(260.0,20.0,h)*0.42*(1.0-town));',
+      /* MACRO TONAL ZONES. Everything above still resolves inside one hue family
+         at low amplitude, and a single hue across a whole landmass is one of the
+         classic markers of synthetic imagery — the island read as one texture at
+         one value. These are the 2-3 km land-use bands a Windward island
+         actually carries, and they are deliberately coarse: the point is that
+         the massif separates into several distinct tonal REGIONS at a glance.
+         Value range is widened hard at both ends — exposed ridge scrub is taken
+         up toward 0.36 linear (about 0.45 luma displayed) and the wet windward
+         canopy down toward 0.05 — because a 2.5-stop spread inside the albedo
+         is what lets the eye read the massif as modelled rather than painted.  */
+      '    float Z1 = fbm2(vW.xz*0.00034 + vec2(101.0,57.0));',
+      '    float Z2 = fbm2(vW.xz*0.00061 + vec2(11.0,83.0));',
+      // dry leeward belt: hard yellowing, the dry-season read
+      '    float dryZ = smoothstep(0.52,0.84, Z1*0.72+Z2*0.28)*smoothstep(560.0,60.0,h)*(1.0-wRock)*(1.0-wBeach);',
+      '    alb = mix(alb, vec3(0.300,0.286,0.140)*(0.78+0.50*M2), dryZ*0.40*(1.0-town)*(1.0-wFor*0.66));',
+      // wet windward belt: the deepest, bluest green on the island
+      '    float wetZ = smoothstep(0.52,0.20, Z1*0.62+Z2*0.38)*smoothstep(30.0,180.0,h)*(1.0-wRock);',
+      '    alb = mix(alb, vec3(0.022,0.052,0.034)*(0.80+0.55*MA), wetZ*0.58*wFor);',
+      // exposed ridge scrub: bleached pale, and bright enough to separate the
+      // crest line from the flank below it at a kilometre
+      '    float expo = smoothstep(0.84,0.97, aoRaw)*smoothstep(0.48,0.82, rid)*smoothstep(150.0,380.0,h);',
+      '    alb = mix(alb, vec3(0.300,0.298,0.176)*(0.82+0.42*M3), expo*0.24*(1.0-wRock)*(1.0-wFor*0.85));',
+      // bare landslip scars: steep ground where the soil sheet has gone entirely
+      '    float slip = smoothstep(0.60,0.86, sl)*smoothstep(0.56,0.86, streak*0.60+M2*0.40)*smoothstep(20.0,70.0,h);',
+      '    alb = mix(alb, cRed*vec3(1.22,1.02,0.88), slip*0.88);',
+      /* The drainage is DARK. Wet, shaded, closed-canopy ground in every ravine
+         is the strongest single tonal separator on a tropical hillside, and
+         because it is keyed to the baked sky-visibility field it lands exactly
+         on the geometry the flow pass cut rather than floating over it.       */
+      '    alb *= mix(1.0, 0.50, gully*0.88);',
+      '    alb *= 0.58 + 0.42*M1 + 0.30*M2 + 0.16*M3;',
+      '    alb.r *= 1.0 + 0.26*(M1-0.5) + 0.16*(MA-0.5) + 0.10*(M3-0.5);',
+      '    alb.b *= 1.0 - 0.22*(M1-0.5) + 0.14*(MB-0.5);',
+      '    alb.g *= 1.0 + 0.10*(MB-0.5);',
       '    alb *= 0.86+0.28*D2.b;',
-      '    alb *= mix(1.0, 0.80+0.42*D.b, near*0.85);',
+      // the fine triplanar tap is a 1.8 m feature: it MUST stay near-field only
+      '    alb *= mix(1.0, 0.80+0.42*D.b, vnear*0.85);',
+      /* Mid-field albedo break, from the band-limited fine ridge field rather
+         than from a texture. This is the term that carries 1.5 km of hillside:
+         the interfluves between the small rills go pale and dry, the rill
+         floors hold darker, wetter vegetation, and because RG2 is the same
+         field that is displacing the normal the tone lines up with the relief
+         instead of floating over it. Band-limited, so it cannot alias.      */
+      '    float rill = RG2.x;',
+      '    alb *= 0.80 + 0.44*rill;',
+      '    alb = mix(alb, alb*vec3(1.16,1.08,0.80), smoothstep(0.62,0.94,rill)*0.55*near);',
+      '    alb = mix(alb, alb*vec3(0.74,0.90,0.86), smoothstep(0.40,0.06,rill)*0.60*near);',
       /* canopy clump shadowing: the same low-frequency density the instanced
          foliage is scattered from, so trees sit ON the ground instead of
          floating as decals over an evenly lit slope.                        */
@@ -1076,19 +1862,24 @@
          individual crowns: the 512-texel cover mask is 8 m per texel and can
          never resolve a 4 m contact shadow, so without this the trees have no
          contact with the ground at all and read as decals pasted on a lawn. */
-      '    float vegLo = smoothstep(0.30,0.78, fbm2(vW.xz*0.0030))*(1.0-wRock)*(1.0-wBeach);',
-      '    float vegHi = smoothstep(0.34,0.80, fbm2(vW.xz*0.075+vec2(17.0,5.0)));',
+      '    float vegLo = smoothstep(0.30,0.78, fbm2(vW.xz*0.0030)+gully*0.30-crest*0.26)*(1.0-wRock)*(1.0-wBeach);',
+      // 13 m crown dapple: sub-pixel past ~1.5 km, so it has to roll off there
+      // or it turns into the salt-and-pepper the reviewer read as "crunch"
+      '    float vegHi = mix(0.55, smoothstep(0.34,0.80, fbm2(vW.xz*0.075+vec2(17.0,5.0))), smoothstep(26.0,7.0,pxs));',
       '    float veg = vegLo*(0.45+0.55*vegHi);',
       '    ao *= (1.0 - 0.52*veg*(1.0-town))*(1.0 - 0.62*contact);',
       '    alb *= 1.0 - 0.30*contact;',
       '    alb *= 1.0 - 0.18*vegLo*vegHi*(1.0-town);',
       '    rough = mix(0.94, 0.70, wRock);',
+      /* Wet sand. The run-up band on a beach with 0.9 m of swell is roughly a
+         metre and a half of vertical, not four — a wide one reads as a stain.
+         Its width breathes with the set so it ties to the ocean module.       */
       '    float swash = 0.55+0.45*sin(uTime*0.66);',
-      '    float wet = smoothstep(4.2+swash*1.6, 0.02, h)*clamp(wBeach+wShore*0.8,0.0,1.0);',
+      '    float wet = smoothstep(1.35+swash*0.85, 0.02, h)*clamp(wBeach+wShore*0.8,0.0,1.0);',
       '    alb *= mix(1.0, 0.40, wet);',
       '    rough = mix(rough, 0.12, wet);',
       '    f0 = mix(0.020, 0.038, wet);',
-      '    dAmp = mix(0.18,1.05,near)*(1.0-0.75*road)*(0.5+0.8*wRock);',
+      '    dAmp = mix(0.18,1.05,vnear)*(1.0-0.75*road)*(0.5+0.8*wRock);',
       '    vegT = clamp((wFor*0.85 + (1.0-wRock)*(1.0-wBeach)*0.30)*(1.0-town), 0.0, 1.0);',
       // the sea is a huge bright reflector: low coastal ground picks up a cool
       // bounce off it that no purely hemispheric ambient term will produce
@@ -1111,7 +1902,7 @@
       '    foam = clamp(foam,0.0,1.0);',
       '    alb = mix(alb, vec3(0.780,0.830,0.860), foam*0.92);',
       '    rough = mix(0.95,0.42,foam); f0 = 0.020;',
-      '    dAmp = mix(0.15,0.75,near)*(1.0-foam);',
+      '    dAmp = mix(0.15,0.75,vnear)*(1.0-foam);',
       '    float rp = sin((vW.x*0.92+vW.z*0.39)*2.9 + fbm2(vW.xz*0.05)*7.0);',
       '    n0 = normalize(n0 + vec3(0.92,0.0,0.39)*rp*0.11*smoothstep(8.0,1.0,d));',
       '  }',
@@ -1132,7 +1923,12 @@
          forest flank goes pale yellow-green well above what its albedo alone
          would give — this is the top half of the 2.5-stop ramp the reviewer
          wanted, and it only lands on ground that is actually vegetated.      */
-      '  c += vegT*vec3(0.070,0.104,0.024)*uSunCol*uSunE*0.3183099*pow(sun,1.35);',
+      '  c += vegT*vec3(0.086,0.122,0.026)*uSunCol*uSunE*0.3183099*pow(sun,1.30);',
+      /* and the other end of the same ramp: canopy that is NOT taking the sun is
+         lit by blue sky alone, so it has to fall toward blue-grey rather than
+         simply getting darker. Without this the shaded flank is the lit flank
+         at a lower exposure and the hillside reads as one painted value.    */
+      '  c += vegT*vec3(0.013,0.024,0.046)*uSkyE*0.3183099*aoT*(1.0-min(sun*1.6,1.0));',
       '  c += uSunCol*uSunE*ggx(N,V,rough)*f0*ndl*shd*cs;',
       '  c += vec3(0.9,0.95,1.0)*foam*uSkyE*0.020;',
       '  c = fogApply(c, vD, -V, vW.y);',
@@ -1147,9 +1943,7 @@
       uHC: { value: coarseTex },
       uC0: { value: new THREE.Vector2(CX0, CZ0) },
       uCN: { value: new THREE.Vector2(CW, CGH) },
-      uCS: { value: CS },
-      uCov: { value: coverTex },
-      uCovR: { value: new THREE.Vector4(VX0, VZ0, 1 / (VX1 - VX0), 1 / (VZ1 - VZ0)) }
+      uCS: { value: CS }
     });
     terrainMesh = new THREE.Mesh(geo, mat);
     terrainMesh.frustumCulled = false;
@@ -1281,10 +2075,10 @@
     const o = opts || {};
     const bb = kind === 'bb', alpha = kind !== 'solid';
     const vs = [
-      'precision highp float;', G_COMMON,
-      'uniform vec3 uWind; uniform float uTime, uSwayH, uSwayA;',
+      'precision highp float;', G_COMMON, G_SUNVS,
+      'uniform vec3 uWind; uniform float uTime, uSwayH, uSwayA, uLean;',
       'attribute vec4 aIns0, aIns1;',
-      'varying vec3 vW, vN; varying vec2 vUv; varying float vD, vT, vB;',
+      'varying vec3 vW, vN; varying vec2 vUv; varying float vD, vT, vB, vTS;',
       'void main(){',
       '  float ph = aIns1.y;',
       '  float sw = (sin(uTime*1.62+ph)+0.55*sin(uTime*2.87+ph*1.7)+0.3*sin(uTime*4.3+ph*2.4))*uWind.z;',
@@ -1297,22 +2091,49 @@
       // as a field of identical round dots
         '  float sq = aIns1.x > 0.02 ? aIns1.x : 1.0;',
         '  float hf = position.y+0.5;',
-        '  vec3 lp = rgt*position.x*aIns0.w + vec3(0.0,1.0,0.0)*hf*aIns0.w*sq;',
-        '  lp.xz += uWind.xy*sw*uSwayA*hf*aIns0.w*0.12;',
+        /* CANOPY LOD. A 10 m crown at 3 km is 1.6 screen pixels: hundreds of
+           sub-pixel silhouettes fighting the sampler, which is the crunchy
+           stair-stepped speckle the review read across the whole far massif.
+           Growing the card by up to a third past 1.8 km overlaps the neighbours
+           into a continuous shell that resolves cleanly, and 13 m at 3 km is
+           still an honest crown size against the buildings.                  */
+        '  float lodS = 1.0 + 0.34*smoothstep(1800.0, 4200.0, length(tc));',
+        '  float sz = aIns0.w*lodS;',
+        '  vec3 lp = rgt*position.x*sz + vec3(0.0,1.0,0.0)*hf*sz*sq;',
+        '  lp.xz += uWind.xy*sw*uSwayA*hf*sz*0.12;',
         '  vec3 wp = aIns0.xyz + lp;',
-        '  vN = normalize(rgt*position.x*1.7 + vec3(0.0,1.0,0.0)*(position.y*0.9+0.25) + fwd*0.80);'
+      /* Rounder card normal. At 1.7 lateral against 0.80 forward the two edges of
+         every billboard swung a full hemisphere apart, so each crown got a hard
+         bright rim on the sun side and a dark core — the cel-shaded pom-pom read.
+         1.05 against 1.15 keeps the crown reading as a sphere without turning
+         its silhouette into a lit outline.                                     */
+        '  vN = normalize(rgt*position.x*1.05 + vec3(0.0,1.0,0.0)*(position.y*0.8+0.34) + fwd*1.15);'
       ].join('\n') : [
         '  float ca=cos(aIns1.x), sa=sin(aIns1.x);',
         '  vec3 p = position*aIns0.w;',
         '  vec3 rp = vec3(p.x*ca+p.z*sa, p.y, -p.x*sa+p.z*ca);',
         '  vec3 rn = vec3(normal.x*ca+normal.z*sa, normal.y, -normal.x*sa+normal.z*ca);',
         '  float hf = clamp(rp.y/(uSwayH*aIns0.w),0.0,1.0); hf=hf*hf;',
+        /* PERMANENT LEAN. A row of dead-vertical trunks at even spacing is the
+           loudest repeating pattern a shoreline can carry — a coconut palm on a
+           windward beach is bent, and no two are bent the same way. The lean is
+           derived from the instance's own phase so it is free (no extra
+           attribute) and deterministic, and it is applied along the trunk's
+           height so the crown swings out over the sand the way a real one does. */
+        '  float lph = aIns1.y;',
+        '  vec2 ldir = vec2(cos(lph*1.7), sin(lph*2.3));',
+        '  float lmag = uLean*(0.30+1.30*fract(lph*0.2387));',
+        '  rp.xz += ldir*lmag*hf*uSwayH*aIns0.w;',
+        '  rp.y  -= lmag*lmag*hf*uSwayH*aIns0.w*0.30;',
         '  rp.xz += uWind.xy*sw*uSwayA*hf*aIns0.w;',
         '  rp.y -= abs(sw)*uSwayA*hf*aIns0.w*0.28;',
         '  vec3 wp = aIns0.xyz + rp;',
         '  vN = normalize(rn);'
       ].join('\n'),
       '  vW = wp; vUv = uv; vT = aIns1.z; vB = aIns1.w;',
+      // ridge shadow from the instance ANCHOR, so every vertex of one crown
+      // agrees and the card cannot be half in shade and half out
+      '  vTS = sunShadowV(aIns0.xyz);',
       '  vD = length(wp-cameraPosition);',
       '  gl_Position = projectionMatrix*viewMatrix*vec4(wp,1.0);',
       '}'
@@ -1320,17 +2141,33 @@
     const fs = [
       'precision highp float;', G_COMMON, G_LIGHT,
       'uniform sampler2D uMap; uniform vec3 uTintA, uTintB; uniform float uRough;',
-      'varying vec3 vW, vN; varying vec2 vUv; varying float vD, vT, vB;',
+      'varying vec3 vW, vN; varying vec2 vUv; varying float vD, vT, vB, vTS;',
       'void main(){',
-      '  vec4 t = texture2D(uMap, vUv);',
+      /* Billboards read one of four crown prototypes out of a 2x2 atlas, keyed
+         to the per-instance jitter float. The radial mask below still uses the
+         UNIT uv, so the silhouette stays mip-stable whichever tile is drawn. */
+      bb ? ['  float tk = floor(fract(vB*0.3719)*16.0);',
+        '  vec2 luv = clamp(vUv, 0.010, 0.990);',
+        // mirror half the instances: 16 tiles read as 32 distinguishable silhouettes
+        '  if (fract(vB*0.7311) > 0.5) luv.x = 1.0-luv.x;',
+        '  vec2 auv = (luv + vec2(mod(tk,4.0), floor(tk*0.25)))*0.25;',
+        '  vec4 t = texture2D(uMap, auv);'].join('\n') : '  vec4 t = texture2D(uMap, vUv);',
       /* Alpha-test coverage is not mip-stable: every mip halves the average
          alpha of a cut-out, so a fixed cutoff erodes the silhouette away with
          distance until the instance disappears entirely. Slide the cutoff down
          with distance to hold roughly constant coverage.                     */
-      alpha ? '  if (t.a < mix(0.40, 0.13, smoothstep(60.0, 700.0, vD))) discard;' : '',
+      /* PROCEDURAL SILHOUETTE. Sliding the cutoff down is only half the story:
+         by the 2x2 and 1x1 mips the cut-out's alpha has averaged to a nearly
+         uniform ~0.55 across the whole card, so a 0.13 cutoff passes every
+         texel and a crown 2 km away renders as a filled SQUARE. That is the
+         "faceted green blob" — the canopy was literally drawing rectangles.
+         A radial mask evaluated from the uv is mip-independent, so the crown
+         keeps a round, soft-edged silhouette at every distance for free.    */
+      bb ? '  float rr = length((vUv-vec2(0.5,0.44))*vec2(1.0,0.92))*2.06;\n  float ta = t.a*smoothstep(1.06, 0.52, rr);' : '  float ta = t.a;',
+      alpha ? '  if (ta < mix(0.40, 0.17, smoothstep(60.0, 700.0, vD))) discard;' : '',
       // per-instance value AND hue jitter: one flat green over a whole hillside
       // is the single loudest "placeholder texture" tell
-      '  vec3 alb = s2l(t.rgb)*mix(uTintA,uTintB,vT);',
+      '  vec3 alb = s2l(t.rgb)*mix(uTintA,uTintB,vT*vT*(3.0-2.0*vT));',
       '  float jb = fract(vB); float jh = floor(vB)*0.01;',
       '  alb *= 0.72+0.62*jb;',
       '  alb.r *= 1.0+0.22*(jh-0.5); alb.b *= 1.0-0.20*(jh-0.5);',
@@ -1340,7 +2177,10 @@
       '  float ndl = dot(N,uSunDir);',
       '  float wrapd = max((ndl+0.42)/1.42, 0.0);',
       '  float trans = 0.52*max(-ndl,0.0)*pow(max(dot(V,-uSunDir),0.0),1.6);',
-      '  float cs = cloudShadow(vW);',
+      // ridge shadow as well as cloud: a canopy in a valley the ridge has shaded
+      // must go with it, or the trees read as decals over an evenly lit slope.
+      // vTS is the vertex-stage march (see G_SUNVS).
+      '  float cs = cloudShadow(vW)*vTS;',
       /* Sunlit canopy is a translucent yellow-green, not the same green in a
          brighter key: the leaf transmits, so the lit side gains chroma toward
          yellow while the shaded side falls toward blue-green. Matching that
@@ -1361,7 +2201,8 @@
       uTintB: { value: new THREE.Color(o.tintB || 0xffffff) },
       uRough: { value: o.rough === undefined ? 0.55 : o.rough },
       uSwayH: { value: o.swayH === undefined ? 8.0 : o.swayH },
-      uSwayA: { value: o.swayA === undefined ? 0.10 : o.swayA }
+      uSwayA: { value: o.swayA === undefined ? 0.10 : o.swayA },
+      uLean: { value: o.lean === undefined ? 0.0 : o.lean }
     }, { side: THREE.DoubleSide });
   }
 
@@ -1521,17 +2362,47 @@
       COVER[k] = v > 255 ? 255 : v;
     }
   }
+  /* OCCLUDER HEIGHT. The alpha channel of the same 512² cover field, holding the
+     top of whatever stands on each texel in metres/48. objShadow() marches this
+     along the live sun vector, which is the only reason a crown or a roof now
+     lays a shadow on the ground beside it instead of hovering there like a
+     sticker. 8.2 m/texel is coarse for one tree but exactly the scale of the
+     clumps the canopy forms, and the shadow of a clump is what the eye reads at
+     a kilometre. Max-combine, not additive: two trees do not make a 20 m tree. */
+  function stampHeight(x, z, r, h) {
+    if (!COVER || h <= 0.4) return;
+    const sx = LCN / (VX1 - VX0), sz = LCN / (VZ1 - VZ0);
+    const cx = (x - VX0) * sx, cz = (z - VZ0) * sz;
+    const rx = Math.max(0.55, r * sx), rz = Math.max(0.55, r * sz);
+    const i0 = Math.max(0, Math.floor(cx - rx)), i1 = Math.min(LCN - 1, Math.ceil(cx + rx));
+    const j0 = Math.max(0, Math.floor(cz - rz)), j1 = Math.min(LCN - 1, Math.ceil(cz + rz));
+    const v = Math.min(255, Math.round(h * (255 / 48)));
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      const d = Math.hypot((i + 0.5 - cx) / rx, (j + 0.5 - cz) / rz);
+      if (d > 1.0) continue;
+      const k = (j * LCN + i) * 4 + 3;
+      // taper at the rim so a clump edge throws a soft shadow, not a stepped one
+      const vv = d > 0.62 ? v * (1.0 - (d - 0.62) / 0.38 * 0.55) : v;
+      if (COVER[k] < vv) COVER[k] = vv;
+    }
+  }
   function buildVegetation(scene, hi) {
     const P = palmGeos();
     toFoliage(P.crown);
-    const trunkMat = foliageMat(TEX.bark, 'solid', { tintA: 0xb8a184, tintB: 0x8d7758, swayH: 7.6, swayA: 0.055, rough: 0.86 });
-    const crownMat = foliageMat(TEX.frond, 'inst', { tintA: 0x9ad86f, tintB: 0x6fae50, swayH: 7.6, swayA: 0.13, rough: 0.62 });
-    const scrubMat = foliageMat(TEX.leaf, 'inst', { tintA: 0xb2dc84, tintB: 0x6f9752, swayH: 1.5, swayA: 0.06, rough: 0.6 });
+    // uLean MUST match between trunk and crown or the crown detaches from the tree
+    const PALM_LEAN = 0.155;
+    const trunkMat = foliageMat(TEX.bark, 'solid', { tintA: 0xc4ad90, tintB: 0x8d7758, swayH: 7.6, swayA: 0.055, rough: 0.86, lean: PALM_LEAN });
+    const crownMat = foliageMat(TEX.frond, 'inst', { tintA: 0x9ad86f, tintB: 0x6fae50, swayH: 7.6, swayA: 0.13, rough: 0.62, lean: PALM_LEAN });
+    const scrubMat = foliageMat(TEX.leaf, 'inst', { tintA: 0xb2dc84, tintB: 0x6f9752, swayH: 1.5, swayA: 0.06, rough: 0.6, lean: 0.05 });
     /* The canopy sheet is the biggest single area of the island at range, so its
        tint IS the island's colour from the water. The old dark end (0x466c39)
        sat well below the terrain albedo under it, which turned every wooded
        flank into a dark stain and flattened the whole mass to one value.    */
-    const canopyMat = foliageMat(TEX.canopy, 'bb', { tintA: 0x93c66c, tintB: 0x4e7a3d, swayA: 0.9, rough: 0.7 });
+    /* tintA is the sun-baked flank, tintB the shaded one — the pair now spans a
+       HUE arc (yellow-green to a cool blue-green) rather than one green at two
+       exposures, and tintB was lifted out of the near-black it sat at, which is
+       what turned every crown into a separate dark dot on a pale slope.      */
+    const canopyMat = foliageMat(TEX.canopy, 'bb', { tintA: 0xa9cf72, tintB: 0x53806a, swayA: 0.9, rough: 0.7 });
 
     const S = { s: 0x51a7c3 };
     const palms = [], scrub = [], canopy = [];
@@ -1540,27 +2411,54 @@
        has to be a CONTINUOUS sheet with the ground only showing through where
        it genuinely thins, so the count goes up roughly 3x and the crowns
        overlap. They are 4-vertex instanced billboards; the cost is trivial. */
-    const NS = hi ? 11000 : 3000, NC = hi ? 44000 : 11000;
+    /* Crown count had to rise with the crown SIZE fix: honest 8-15 m crowns
+       cover a third of the ground that the old 7.5-27.5 m ones did, and a
+       canopy that does not close is a field of dots whatever its colour.     */
+    const NS = hi ? 11000 : 3000, NC = hi ? 86000 : 20000;
     // per-instance hue index (0..99) and value fraction, packed into one float
     const jit = (hue, val) => Math.floor(clamp(hue, 0, 0.999) * 100) + clamp(val, 0, 0.999);
 
     /* 1. the beach palm line. Thin verticals at the sand/vegetation terminator
        are the strongest read in the whole frame per vertex spent, so they are
        placed deliberately along the shoreline rather than left to the scatter. */
-    for (let z = VZ0 + 30; z < VZ1 - 30; z += 11 + rnd(S) * 26) {
+    /* CLUMPED, not ruled. The old loop advanced a fixed 11-37 m and dropped 2-4
+       trunks in a 16 m box every time, which over 4 km of coast is a picket
+       fence of near-identical verticals at a near-constant pitch — the single
+       most obvious repeating pattern in the frame. Palms on a real beach grow
+       in groves separated by long bare stretches: cluster centres are drawn
+       with heavy-tailed gaps, each grove gets a radius and a count, and the
+       trunk height spans 5-19 m instead of the old 6-12 so the row has a
+       broken skyline of its own. Lean (uLean, above) does the rest.         */
+    for (let z = VZ0 + 30; z < VZ1 - 30;) {
+      // heavy-tailed gap: mostly tight groves, occasionally a long empty bay
+      const gap = 13 + Math.pow(rnd(S), 1.9) * 170;
+      z += gap;
+      if (z >= VZ1 - 30) break;
       const cx = coastX(z);
       if (islandEnv(cx + 30, z) > -40) continue;
-      for (let k = 0; k < 2 + (rnd(S) * 3 | 0); k++) {
-        const x = cx + 3 + rnd(S) * 30, zz = z + (rnd(S) - 0.5) * 16;
+      // a grove skips entirely on the rocky headlands: no sand, no coconut
+      const gN = 0.5 + 0.5 * Math.sin(z * 0.0042) + 0.5 * fbm(z * 0.0021, 4.4, 2);
+      if (gN < 0.42 && rnd(S) < 0.75) continue;
+      const nG = 1 + (Math.pow(rnd(S), 0.55) * 11) | 0;
+      const gr = 7 + rnd(S) * 26;
+      const gs = 0.62 + rnd(S) * 0.55;                     // grove-wide size bias
+      for (let k = 0; k < nG; k++) {
+        const a = rnd(S) * 6.283, rr = Math.pow(rnd(S), 0.62) * gr;
+        const x = cx + 2.5 + Math.abs(Math.cos(a)) * rr + rnd(S) * 9;
+        const zz = z + Math.sin(a) * rr;
         if (waterField(x, zz) > -1.5) continue;
         const y = I.heightAt(x, zz);
-        if (y < 0.4 || y > 26) continue;
-        if (slopeAt(x, zz).s > 0.55) continue;
+        if (y < 0.4 || y > 30) continue;
+        if (slopeAt(x, zz).s > 0.62) continue;
+        // trunk is 7.6 m tall at s=1, so 0.66..2.5 spans roughly 5 m to 19 m
+        const s = clamp(gs * (0.72 + Math.pow(rnd(S), 1.5) * 1.85), 0.62, 2.5);
         palms.push({
-          x, y: y - 0.15, z: zz, s: 0.80 + rnd(S) * 0.75, r: rnd(S) * 6.283,
-          p: rnd(S) * 6.283, t: rnd(S), b: jit(rnd(S), 0.30 + rnd(S) * 0.62)
+          x, y: y - 0.15, z: zz, s, r: rnd(S) * 6.283,
+          p: rnd(S) * 6.283, t: rnd(S), b: jit(rnd(S), 0.28 + rnd(S) * 0.66)
         });
-        stampCover(x, zz, 3.2, 0.30);
+        stampCover(x, zz, 3.0 * s, 0.30);
+        // a 12 m palm at 29 deg sun throws a 21 m shadow; it has to land on the sand
+        stampHeight(x, zz, 2.4 * s, 7.6 * s * 0.92);
       }
     }
     // and a fringe round the lagoon and the marina basin
@@ -1576,6 +2474,7 @@
         p: rnd(S) * 6.283, t: rnd(S), b: jit(rnd(S), 0.30 + rnd(S) * 0.6)
       });
       stampCover(x, z, 3.2, 0.28);
+      stampHeight(x, z, 2.6, 7.6 * 0.9);
     }
 
     /* 2. scrub — dry, sun-baked west-facing slopes below the forest line */
@@ -1601,38 +2500,126 @@
        out on the dry faces and stopping dead where the town starts           */
     guard = 0;
     const CR = 2100;
-    while (canopy.length < NC && guard++ < 700000) {
+    while (canopy.length < NC && guard++ < 3400000) {
       const x = -280 + (rnd(S) - 0.5) * 2 * CR, z = -420 + (rnd(S) - 0.5) * 2 * CR;
       if (waterField(x, z) > -3) continue;
       const y = I.heightAt(x, z);
       if (y < 4) continue;
       const sp = slopeAt(x, z);
       const east = clamp(-sp.gx * 1.6 + 0.45, 0, 1);      // windward, wetter
-      let dens = 0.52 + 0.48 * fbm(x * 0.0030, z * 0.0030, 3);
-      dens *= 0.55 + 0.45 * east;
+      let dens = 0.34 + 0.66 * fbm(x * 0.0030, z * 0.0030, 3);
+      dens *= 0.68 + 0.32 * east;
       dens *= sstep(4, 34, y);
-      // thin out on the exposed crests: wind-clipped ridge scrub, not closed canopy
-      dens *= 1 - 0.55 * sstep(210, 340, y);
-      dens *= 1 - 0.80 * sstep(0.55, 1.05, sp.s);          // bare rock on the cliffs
+      /* The old 210 -> 340 m ramp took HALF the canopy off the upper massif and
+         printed a visible tree line across the ridges — there is no such line
+         below 800 m anywhere in the Caribbean, and it is what made the crests
+         read as bare modelling clay. Grenada's forest runs straight over the
+         top; what actually changes up there is that the crowns get smaller and
+         wind-clipped, which is what the 3b fringe pass below is for.          */
+      dens *= 1 - 0.22 * sstep(300, 470, y);
+      /* Slope gate recalibrated against the sharpened terrain. At 0.55 -> 1.05 it
+         was stripping the canopy off the entire upper half of every flank the
+         crest-fold pass steepened, which put a bare band under every ridge —
+         the tree line the reviewer called out, reintroduced by geometry rather
+         than by altitude. Rainforest holds on to 50 degrees quite happily.    */
+      dens *= 1 - 0.72 * sstep(0.95, 1.70, sp.s);
+      /* GULLY CLUMPING. A smooth fbm density thins EVERYWHERE at once, which is
+         why 44k crowns rendered as evenly-spaced confetti instead of forest:
+         nowhere was it dense enough to close and nowhere was it empty. Rain
+         forest lives in the drainage — so weight by the LOCAL CONCAVITY of the
+         eroded surface (a 24 m discrete Laplacian: positive in a gully, negative
+         on a spur) and then square the whole density up into clumps that either
+         close completely or leave the slope bare.                             */
+      /* Exact early-out. The concavity term below can only multiply dens by at
+         most (0.34+0.98)=1.32, and the sharpener zeroes anything under 0.15,
+         so a candidate at dens < 0.1136 can never be accepted — bailing here
+         skips four heightAt calls for roughly three quarters of the draws and
+         changes nothing about the result.                                    */
+      if (dens < 0.0729) continue;
+      const lap = (I.heightAt(x + 24, z) + I.heightAt(x - 24, z) +
+        I.heightAt(x, z + 24) + I.heightAt(x, z - 24)) * 0.25 - y;
+      const gul = clamp(0.5 + lap * 0.16, 0, 1);
+      /* Gully clumping keeps its bias but no longer strips the ridges: at a
+         0.34 floor the broad convex ridge tops came out as bare khaki domes,
+         which is the tree line again by another route. Grenada's forest closes
+         over the crests; the gullies are darker and denser, not the only
+         place anything grows.                                                */
+      dens *= 0.56 + 0.80 * gul;
+      dens = clamp((dens - 0.15) * 1.75, 0, 1);
       if (rnd(S) > dens) continue;
       if (rnd(S) < coverAt(x, z) * 0.95) continue;
       const far = Math.hypot(x + 280, z + 420) > 1200;
-      const s = far ? 11 + rnd(S) * 13 : 7.0 + rnd(S) * 9.0;
-      // gully canopy is darker and bluer, ridge canopy lighter and yellower
-      const v = clamp(0.20 + 0.75 * sstep(0.9, 0.1, sp.s) * (0.4 + 0.6 * rnd(S)), 0, 0.98);
+      /* CROWN SIZE. The old law ran 7.5 -> 27.5 m and deliberately made the
+         DISTANT crowns bigger, which is exactly backwards: at 2 km those read as
+         40-60 m across against the buildings and shrank a 400 m mountain into a
+         hill. A tropical crown is 8-15 m. This is a proper log-normal about
+         8.8 m — the natural distribution for tree diameter — clamped to
+         0.5x-2.2x, so the sheet is mostly mid-size crowns with a scatter of
+         genuine emergents standing a head above, and the same law everywhere so
+         scale stays honest with distance.                                     */
+      const u1 = rnd(S), u2 = rnd(S);
+      const gz1 = Math.sqrt(-2 * Math.log(u1 + 1e-6)) * Math.cos(6.283185 * u2);
+      const s = clamp(10.4 * Math.exp(0.40 * gz1), 5.2, 22.9);
+      /* Value by ASPECT, not by slope. The sun-baked flank blows out to a pale
+         yellow-green and the flank in its own shade falls to a cool blue-grey;
+         keying the same jitter to slope alone gave one green with random noise
+         on it, which is the flat-decal read.                                  */
+      const wface = clamp(sp.gx * 1.9 + 0.42, 0, 1);
+      const v = clamp(0.20 + 0.50 * wface - 0.17 * gul + 0.22 * (rnd(S) - 0.5), 0, 0.98);
       canopy.push({
         x, y: y - s * 0.10, z, s, r: 0.52 + rnd(S) * 0.62, p: rnd(S) * 6.283, t: rnd(S),
         b: jit(rnd(S), v)
       });
       if (!far) stampCover(x, z, s * 0.45, 0.22);
+      // the crown's own occluder height, so it darkens the ground beside it
+      stampHeight(x, z, s * 0.42, s * 0.86);
+    }
+    /* 3b. THE SKYLINE FRINGE. The scatter above thins on the crests by design
+       (wind-clipped ridge scrub), and the result was a landmass whose entire
+       silhouette was a clean, smooth, bare curve against the sky — the classic
+       low-res-heightfield tell, and the one edge in the frame the eye reads
+       first. Grenada's ridges carry a broken, ragged tree line right over the
+       top. This pass places small wind-stunted crowns where the surface is
+       CONVEX (a spur or a crest, negative Laplacian) and high, so the skyline
+       gets an organic serrated edge without closing the canopy up there.    */
+    guard = 0;
+    const CRR = 3000;
+    let crest = 0;
+    const NCR = hi ? 20000 : 5000;
+    while (crest < NCR && guard++ < 900000) {
+      const x = -280 + (rnd(S) - 0.5) * 2 * CRR, z = -520 + (rnd(S) - 0.5) * 2 * CRR;
+      if (waterField(x, z) > -3) continue;
+      const y = I.heightAt(x, z);
+      if (y < 55) continue;
+      const lap = (I.heightAt(x + 30, z) + I.heightAt(x - 30, z) +
+        I.heightAt(x, z + 30) + I.heightAt(x, z - 30)) * 0.25 - y;
+      const conv = clamp(0.5 - lap * 0.14, 0, 1);          // 1 on a sharp spur
+      let dens = conv * conv * sstep(55, 190, y);
+      dens *= 0.30 + 0.70 * fbm(x * 0.0062 + 3.3, z * 0.0062 - 1.7, 3);
+      dens *= 1 - 0.55 * sstep(1.10, 1.85, slopeAt(x, z).s);
+      if (rnd(S) > dens * 0.86) continue;
+      // stunted: half the size of a valley crown, and paler / drier in hue
+      const s = 4.2 + Math.pow(rnd(S), 1.4) * 7.4;
+      canopy.push({
+        x, y: y - s * 0.06, z, s, r: 0.45 + rnd(S) * 0.75, p: rnd(S) * 6.283,
+        t: 0.15 + rnd(S) * 0.45, b: jit(rnd(S), 0.42 + rnd(S) * 0.50)
+      });
+      stampHeight(x, z, s * 0.40, s * 0.80);
+      crest++;
     }
     const CELLV = 520;   // bucket size trades frustum-cull granularity against draw calls
+    /* LOD RANGES. A 2 m bush at 1500 m is 1.3 SCREEN PIXELS, and the leaf card
+       is far darker than the slope it stands on, so 11k of them rendered as
+       salt-and-pepper speckle over the whole coastal shelf — the single
+       loudest "this is CG" artefact left on the island after the terrain fix.
+       Cut them where they stop being a shape; the terrain shader's own dapple
+       (vegHi, 13 m) carries the texture beyond that with no aliasing.       */
     for (const [, arr] of bucketise(palms, CELLV)) {
-      instBucket(P.trunk, arr, trunkMat, 9, 1900, scene);
-      instBucket(P.crown, arr, crownMat, 9, 1900, scene);
+      instBucket(P.trunk, arr, trunkMat, 9, 1250, scene);
+      instBucket(P.crown, arr, crownMat, 9, 1250, scene);
     }
     const SG = scrubGeo();
-    for (const [, arr] of bucketise(scrub, CELLV)) instBucket(SG, arr, scrubMat, 2.5, 1500, scene);
+    for (const [, arr] of bucketise(scrub, CELLV)) instBucket(SG, arr, scrubMat, 2.5, 760, scene);
     const BB = new THREE.PlaneGeometry(1, 1);
     for (const [, arr] of bucketise(canopy, CELLV)) instBucket(BB, arr, canopyMat, 20, 5200, scene);
   }
@@ -1641,14 +2628,27 @@
   function buildTown(scene, hi) {
     const S = { s: 0x2f61bb };
     const wallItems = [], roofItems = [];
-    const wallCols = [0xf6ead0, 0xf0dcbe, 0xe8e2d2, 0xf7e8c8, 0xdfe8e2, 0xf2d8c0, 0xe6dcc4,
-      0xf2c9a8, 0xcfe0e4, 0xf6dcae, 0xe4cdb4];
+    /* St George's is not a cream town — it is pink, ochre, apricot and mint
+       under terracotta, and the pastels have to be genuinely CHROMATIC or the
+       tiers read as one biscuit-coloured mass. Roughly a third pinks, a third
+       ochre/apricot, a third cool cream and mint.                            */
+    const wallCols = [0xf3c9c2, 0xeeb3ae, 0xf0d0b2, 0xe8b98d, 0xf6ead0, 0xf0dcbe,
+      0xdfe8e2, 0xf7e8c8, 0xe6a9a0, 0xf2d8c0, 0xefc79a, 0xcfe0e4, 0xf6dcae,
+      0xe4cdb4, 0xf2c9a8, 0xd9c7dd];
     /* Terracotta, and it has to be BRIGHT. The roof albedo is the product of
        this vertex colour and the tile texture, so a "correct looking" mid
        terracotta in both lands the roofs darker than the hillside behind them
        and the town reads as a stain rather than the landmark of the frame. */
-    const roofCols = [0xd2624a, 0xc75c40, 0xde7153, 0xbb5338, 0xcd6344, 0xac5340];
-    const N = hi ? 940 : 380;
+    /* Pantile is not one colour either. Six near-identical terracottas read as
+       one stamped roof repeated; this spans faded orange through deep oxide red
+       to the grey-green of an old galvanised sheet roof, which is half of what
+       is actually on a Grenadian hillside.                                    */
+    const roofCols = [0xd2624a, 0xc75c40, 0xde7153, 0xbb5338, 0xcd6344, 0xac5340,
+      0xe08a5e, 0x9c4a34, 0xc98a62, 0x8e6f5c, 0x7f8d84, 0x6f7f86,
+      0xb5654a, 0xd97a52, 0xa85a46];
+    // headroom above what the contour-street pass places, so the infill between
+    // the tiers still runs and the blocks read as solid rather than as a grid
+    const N = hi ? 1600 : 620;
     let n = 0, guard = 0;
     const boxCache = new Map();
     function box(w, h, d) {
@@ -1657,6 +2657,30 @@
       return boxCache.get(k);
     }
     const roofGeo = new THREE.ConeGeometry(1, 1, 4, 1);
+    /* GABLE. Every roof in the previous pass was the same four-sided hip cone,
+       so the town's whole silhouette was one repeated triangle. A unit gable
+       prism (ridge along +z) gives a second, quite different roof profile, and
+       a plain slab gives a third for the flat-roofed concrete blocks that are
+       just as common in the real town.                                        */
+    function gableGeo() {
+      const V = [
+        [-0.5, 0, -0.5], [0.5, 0, -0.5], [-0.5, 0, 0.5], [0.5, 0, 0.5],
+        [0, 1, -0.5], [0, 1, 0.5]
+      ];
+      const F = [[0, 2, 5], [0, 5, 4], [1, 4, 5], [1, 5, 3], [0, 4, 1], [2, 3, 5]];
+      const pos = new Float32Array(F.length * 9), uvs = new Float32Array(F.length * 6);
+      for (let f = 0; f < F.length; f++) for (let k = 0; k < 3; k++) {
+        const v = V[F[f][k]];
+        pos[f * 9 + k * 3] = v[0]; pos[f * 9 + k * 3 + 1] = v[1]; pos[f * 9 + k * 3 + 2] = v[2];
+        uvs[f * 6 + k * 2] = v[2] + 0.5; uvs[f * 6 + k * 2 + 1] = v[1];
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      g.computeVertexNormals();
+      return g;
+    }
+    const gGeo = gableGeo();
     // 6 m occupancy grid: a tiered town has to pack, but not interpenetrate
     const occ = new Set();
     function free(x, z, r) {
@@ -1666,7 +2690,13 @@
       for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) occ.add(i + ',' + j);
       return true;
     }
-    function place(x, z, w, d, h, rot, sty) {
+    /* padY, when supplied, is the elevation of the contour street the building
+       fronts onto. Snapping the floor to it is the entire mechanism that makes
+       a tier: every house along one street shares one datum, the fill under the
+       downhill ones becomes a continuous retaining face, and the cut behind the
+       uphill ones reads as a bench. Without it each box floats on its own local
+       ground height and the row dissolves back into scattered confetti.       */
+    function place(x, z, w, d, h, rot, sty, padY) {
       const y = I.heightAt(x, z);
       // Sink the walls to the LOWEST footprint corner. Keying the base to the centre
       // height alone leaves the downhill corners floating on any real hillside.
@@ -1679,8 +2709,11 @@
       }
       // terrace the floor into the hill: cut level with the uphill corner, then
       // carry the wall down to the downhill one so the plinth reads as a retaining wall
-      const fl = lerp(ymin, ymax, 0.68);
-      const foot = Math.min(fl - ymin, 9.0) + 0.7;
+      let fl = lerp(ymin, ymax, 0.68);
+      if (padY !== undefined) fl = clamp(padY + 0.35, ymin - 1.0, ymax + 3.2);
+      // the plinth also has to absorb the mesh-interpolation deficit on a steep
+      // tier, so it runs deeper than the pure terrace cut would need
+      const foot = Math.min(Math.max(fl - ymin, 0), 9.0) + 2.2;
       const wc = lin(wallCols[(rnd(S) * wallCols.length) | 0]);
       wallItems.push({ geo: box(w, h + foot, d), m: TRS(x, fl + (h - foot) / 2, z, rot), c: wc });
       if (foot > 1.8) {   // exposed terrace plinth, in stone not plaster
@@ -1689,16 +2722,48 @@
           m: TRS(x, fl - foot * 0.55, z, rot), c: lin(0x7d7263)
         });
       }
-      const rr = Math.hypot(w, d) * 0.5 * 1.14;
-      const rh = 1.25 + rnd(S) * 1.15 + (sty ? 0.7 : 0);
-      const slant = Math.hypot(rr, rh);
+      /* CUT-AND-FILL PAD. The plinth alone is the building's own footprint; a
+         real terrace is wider than the house, and it is the continuous line of
+         those pads along a street that reads as a tier from the water. This
+         slab runs a metre proud of the walls on all four sides and drops to the
+         downhill ground, so adjacent houses on one contour merge into a single
+         retaining face with a shadow under it.                                */
+      if (padY !== undefined && fl - ymin > 0.6) {
+        const pd = Math.min(fl - ymin + 1.4, 8.0);
+        wallItems.push({
+          geo: box(w + 2.2, pd, d + 1.8),
+          m: TRS(x, fl - 0.20 - pd * 0.5, z, rot), c: lin(0x8a8073)
+        });
+      }
+      const rt = rnd(S);
       const rc = lin(roofCols[(rnd(S) * roofCols.length) | 0]);
       const jr = 0.82 + rnd(S) * 0.42;                     // per-instance terracotta jitter
-      roofItems.push({
-        geo: roofGeo, m: TRS(x, fl + h + rh / 2, z, rot + PI / 4, rr, rh, rr),
-        c: [rc[0] * jr, rc[1] * jr * (0.9 + rnd(S) * 0.22), rc[2] * jr * (0.88 + rnd(S) * 0.25)],
-        us: [2 * PI * rr / 0.34, slant / 0.9]
-      });
+      const rcj = [rc[0] * jr, rc[1] * jr * (0.9 + rnd(S) * 0.22), rc[2] * jr * (0.88 + rnd(S) * 0.25)];
+      let rTop = h;
+      if (rt < 0.44) {                                     // hip
+        const rr = Math.hypot(w, d) * 0.5 * 1.14;
+        const rh = 1.25 + rnd(S) * 1.15 + (sty ? 0.7 : 0);
+        roofItems.push({
+          geo: roofGeo, m: TRS(x, fl + h + rh / 2, z, rot + PI / 4, rr, rh, rr),
+          c: rcj, us: [2 * PI * rr / 0.34, Math.hypot(rr, rh) / 0.9]
+        });
+        rTop = h + rh;
+      } else if (rt < 0.82) {                              // gable, ridge along the long axis
+        const gw = Math.min(w, d) * 1.12, gl = Math.max(w, d) * 1.08;
+        const rh = 1.05 + rnd(S) * 1.35 + (sty ? 0.6 : 0);
+        const grot = rot + (w >= d ? PI / 2 : 0);
+        roofItems.push({
+          geo: gGeo, m: TRS(x, fl + h, z, grot, gw, rh, gl),
+          c: rcj, us: [gl / 0.34, Math.hypot(gw * 0.5, rh) / 0.9]
+        });
+        rTop = h + rh;
+      } else {                                             // flat concrete slab
+        roofItems.push({
+          geo: box(w * 1.05, 0.34, d * 1.05), m: TRS(x, fl + h + 0.17, z, rot),
+          c: [rcj[0] * 0.72, rcj[1] * 0.78, rcj[2] * 0.86], us: [w / 0.9, d / 0.9]
+        });
+        rTop = h + 0.4;
+      }
       // balcony / veranda on the bigger ones
       if (sty && rnd(S) < 0.55) {
         const by = fl + h * 0.52;
@@ -1707,9 +2772,61 @@
           wallItems.push({ geo: box(0.09, 1.0, 0.09), m: TRS(x + k * w * 0.24, by + 0.5, z + d * 0.62, rot), c: lin(0xe8e4d6) });
       }
       stampCover(x, z, Math.max(w, d) * 0.62, 0.34);
+      // the roof ridge as an occluder: objShadow() lays it on the street below
+      stampHeight(x, z, Math.max(w, d) * 0.55, (fl - ymin) + rTop);
       n++;
     }
-    /* Placement is driven by the settlement mask, not a uniform scatter: the
+    /* ---- TIER ONE: buildings snapped to the contour streets ---------------
+       This is the pass the town was missing entirely. Every house here fronts
+       onto a traced contour, shares its street's datum, faces it, and sits on a
+       cut-and-fill pad; the risers between the streets carry a retaining wall.
+       Five footprint types and one-to-four storeys, drawn against the local
+       settlement density so the waterfront packs tall and narrow and the upper
+       slopes thin to detached bungalows.                                     */
+    const FOOT = [
+      [5.0, 4.4], [6.6, 5.2], [8.4, 6.0], [11.0, 6.8], [7.2, 8.6]
+    ];
+    for (let r = 0; r < TOWNROADS.length; r++) {
+      const R = TOWNROADS[r], P = R.pts;
+      for (let i = 1; i < P.length - 1; i++) {
+        const px = P[i][0], pz = P[i][1];
+        const dens = coverAt(px, pz);
+        if (dens < 0.05) continue;
+        const dx = P[i + 1][0] - P[i - 1][0], dz = P[i + 1][1] - P[i - 1][1];
+        const L = Math.hypot(dx, dz) || 1;
+        const nx = -dz / L, nz = dx / L;        // across the street
+        // the riser below the carriageway: a continuous retaining wall, which is
+        // what actually makes a hillside town read as stacked
+        if ((i % 2) === 0 && rnd(S) < 0.55 + 0.4 * dens) {
+          const wx0 = px - nx * (R.w * 0.5 + 0.5), wz0 = pz - nz * (R.w * 0.5 + 0.5);
+          const gyy = I.heightAt(wx0, wz0);
+          const dropA = clamp(R.y - gyy + 1.0, 0.8, 6.0);
+          STONE.push({
+            geo: bx(12.0, dropA, 0.9),
+            m: TRS(wx0, R.y + 0.4 - dropA * 0.5, wz0, Math.atan2(nx, nz)),
+            c: lin(0x8d8375), us: [12.0 / 3.2, dropA / 3.0]
+          });
+        }
+        for (let side = -1; side <= 1; side += 2) {
+          if (rnd(S) > 0.26 + 0.70 * dens) continue;
+          const off = side * (R.w * 0.5 + 3.4 + rnd(S) * 3.0);
+          const bxp = px + nx * off, bzp = pz + nz * off;
+          if (waterField(bxp, bzp) > -4) continue;
+          if (slopeAt(bxp, bzp).s > 1.05) continue;
+          const F = FOOT[(rnd(S) * FOOT.length) | 0];
+          const w = F[0] * (0.86 + rnd(S) * 0.36), d = F[1] * (0.86 + rnd(S) * 0.36);
+          if (!free(bxp, bzp, Math.max(w, d) * 0.5)) continue;
+          // storeys 1-4, taller and denser the closer to the harbour
+          const st = 1 + Math.min(3, (Math.pow(rnd(S), 1.0 - dens * 0.55) * 4) | 0);
+          const h = st * 3.05 + rnd(S) * 0.6;
+          // facade square to the street, with only a few degrees of slop
+          const rot = Math.atan2(nx * side, nz * side) + (rnd(S) - 0.5) * 0.18;
+          place(bxp, bzp, w, d, h, rot, st >= 3, R.y);
+        }
+      }
+    }
+    /* ---- TIER TWO: the infill between the streets -------------------------
+       Placement is driven by the settlement mask, not a uniform scatter: the
        density already folds in altitude, slope, harbour proximity and road
        access, so the town packs solid round the Carenage, thins going uphill
        and stops dead on the steep upper third.                               */
@@ -1758,33 +2875,180 @@
     const rm = add(scene, new THREE.Mesh(merge(roofItems), roofMat));
     wm.frustumCulled = rm.frustumCulled = true;
     for (const g of boxCache.values()) g.dispose();
-    roofGeo.dispose();
+    roofGeo.dispose(); gGeo.dispose();
 
     /* ---- Fort George: stone bastion on the headland bluff --------------- */
-    const fx = -436, fz = -142, fy = I.heightAt(fx, fz);
-    const st = [], sc = lin(0x9a8f7d), sc2 = lin(0x877c68);
-    st.push({ geo: new THREE.CylinderGeometry(30, 35.5, 11, 8, 1, true), m: TRS(fx, fy + 4.0, fz, PI / 8), c: sc, us: [22, 4] });
-    st.push({ geo: new THREE.CylinderGeometry(30.6, 30.6, 1.5, 8), m: TRS(fx, fy + 10.2, fz, PI / 8), c: sc2, us: [22, 1] });
-    for (let i = 0; i < 40; i++) {
-      const a = i / 40 * 6.283 + 0.08;
+    /* Anything wide on a sharp crest has to be keyed to the LOWEST height under
+       its footprint, not the centre. The rendered ridge is a linear interpolant
+       between mesh vertices ~30 m apart at this stand-off, so it always cuts the
+       corner BELOW the analytic field the placement reads — a 71 m bastion keyed
+       to its centre height floats clear of the ridge with its underside showing.
+       Sampling the footprint and then sinking a further 6 m buries the plinth
+       instead, which is what a fort dug into a bluff should look like anyway. */
+    /* SITE SELECTION, not a hard-coded coordinate. The fort was pinned to
+       (-436,-142) and every attempt to make it sit down failed for a reason no
+       amount of sinking could fix: the ground under that point falls 80 m
+       across the 54 m footprint. ANY rigid structure there either floats on the
+       downhill side or drowns on the uphill one, and the "floating slab" the
+       review kept seeing was the geometry telling the truth about the site.
+       A fort is built where a fort CAN be built, so this scans the headland for
+       the flattest ground above 55 m and puts it there. The score is relief
+       under the footprint first, then altitude and proximity to the original
+       bluff, so the landmark stays on the same headland above the harbour.  */
+    const RW = 20.0, RT = 30.0;
+    function siteRelief(x, z, r) {
+      let lo = I.heightAt(x, z), hi2 = lo;
+      for (let a = 0; a < 6.283; a += 0.52) for (const rr of [r * 0.55, r, r * 1.35]) {
+        const h = I.heightAt(x + Math.cos(a) * rr, z + Math.sin(a) * rr);
+        if (h < lo) lo = h;
+        if (h > hi2) hi2 = h;
+      }
+      return { lo, hi: hi2, rel: hi2 - lo };
+    }
+    let fx = -436, fz = -142, fBest = -1e9, fSite = null;
+    for (let sx = -640; sx <= -250; sx += 10) for (let sz = -400; sz <= 90; sz += 10) {
+      if (waterField(sx, sz) > -RT * 1.6) continue;
+      const S0 = siteRelief(sx, sz, RW);
+      if (S0.hi < 55) continue;
+      const score = -S0.rel * 1.0 + S0.hi * 0.30 - Math.hypot(sx + 436, sz + 142) * 0.055;
+      if (score > fBest) { fBest = score; fx = sx; fz = sz; fSite = S0; }
+    }
+    if (!fSite) fSite = siteRelief(fx, fz, RW);
+    /* Parapet keyed to the HIGHEST ground under the curtain, not the lowest.
+       The rendered crest is a linear interpolant between mesh vertices ~17 m
+       apart at this stand-off and always cuts below the analytic field, so a
+       parapet keyed to the low corner puts the whole upper works underground;
+       keyed high, the piers below simply run deeper and stay buried.        */
+    const fy = fSite.hi;
+    /* Fort George is the one built landmark on the skyline in island-approach,
+       and at 1.9 km it was reading as a dark brown BOX on the ridge: the vertex
+       colour is multiplied by the stone texture (mid-grey, ~0.21 after s2l), so
+       a "correct" mid-stone lands the bastion at a third of the albedo of the
+       hillside behind it. Weathered coral-limestone under a tropical sun is
+       genuinely pale — this is the value it has to start at to survive the
+       texture product and land ABOVE the slope, which is what makes it read as
+       masonry rather than a hole in the terrain.                             */
+    const st = [], sc = lin(0xe8dfcc), sc2 = lin(0xd2c7b0);
+    /* Per-vertex tonal break. At 1.9 km the 512-px masonry texture has mipped to
+       a flat average and the solid material's detail normal is gated off past
+       160 m, so ANY textured value the fort is given arrives at the eye as one
+       untextured tone — which is precisely why it read as a painted slab. Only
+       two things survive that distance: geometry, and VERTEX colour. This
+       stains the wall in vertical courses (a hash on the horizontal position)
+       and drops the value toward the base where the masonry is damp and
+       lichened, so the curtain carries a value range without any texture at
+       all. Streaks are keyed to x/z so they run down the wall, not around it. */
+    function weather(base, dark, y0, y1) {
+      return function (y, x, z) {
+        const t = clamp((y - y0) / Math.max(y1 - y0, 1e-3), 0, 1);
+        // vertical courses: quantise the angle so the stain runs in bands
+        const a = Math.atan2(z - fz, x - fx);
+        const b = Math.floor(a * 5.5) * 0.37 + Math.floor(y * 0.55) * 0.11;
+        const n = hash((b * 97) | 0, ((b * 31 + 7) | 0)) * 0.34 + hash((y * 3.1) | 0, (b * 13) | 0) * 0.20;
+        /* Keep the MEAN where the flat version was. The vertex colour is
+           multiplied by the stone texture (~0.27 linear after s2l), so any
+           net darkening here drops the bastion below the hillside albedo and
+           it reverts to reading as a hole in the terrain rather than masonry.
+           This band has mean ~1.0 and a +/-25% spread — variation, not loss. */
+        const v = (0.86 + 0.30 * n) * lerp(dark, 1.0, Math.pow(t, 0.62));
+        return [base[0] * v, base[1] * v * (0.985 + 0.03 * n), base[2] * v * (0.94 + 0.05 * n)];
+      };
+    }
+    /* TERRAIN-SNAPPED, sector by sector. Every previous version of this fort
+       was a CONCENTRIC SOLID — a cylinder, or a stack of them — placed at one
+       height. On a headland whose ground falls 40 m across the footprint that
+       is geometrically guaranteed to float on the low side and bury itself on
+       the high side, and no amount of sinking fixes both at once: sink it far
+       enough to bury the seaward foot and the landward parapet disappears.
+       So the curtain is no longer a solid of revolution. It is 18 independent
+       tangential piers, each one sampling the heightfield UNDER ITSELF and
+       running from 16 m below its own ground up to the shared parapet line.
+       Contact is then structural, not a tuning constant, and the wall carries
+       a stepped, battered profile — which is what a bastion cut into a bluff
+       actually looks like.                                                   */
+    const NSEC = 16;
+    const fTop = fy + 9.5;
+    const PW = weather(sc, 0.80, fy - 18, fy + 12);
+    const PW2 = weather(sc2, 0.84, fy - 18, fy + 12);
+    // lowest ground under a tangential pier, so the pier cannot float at a corner
+    function groundUnder(cx, cz, half) {
+      let g = I.heightAt(cx, cz);
+      for (let k = -1; k <= 1; k += 2) for (const q of [half * 0.7, half]) {
+        const h1 = I.heightAt(cx + k * q, cz), h2 = I.heightAt(cx, cz + k * q);
+        if (h1 < g) g = h1;
+        if (h2 < g) g = h2;
+      }
+      return g;
+    }
+    for (let i = 0; i < NSEC; i++) {
+      const a = i / NSEC * 6.283 + 0.11;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const px = fx + ca * RW, pz = fz + sa * RW;
+      const wSeg = 2 * PI * RW / NSEC * 1.22;               // overlap: no gaps at the joints
+      // clamp: a pier over ground that has fallen right away becomes a tower,
+      // which reads worse than the terrace stopping there
+      const g = Math.max(groundUnder(px, pz, wSeg * 0.5), fy - 26.0);
+      const hgt = (fTop - (g - 14.0));
+      // pier: long axis tangential, battered by making the outer skirt wider
       st.push({
-        geo: new THREE.BoxGeometry(2.6, 2.2, 1.5),
-        m: TRS(fx + Math.cos(a) * 30.0, fy + 12.0, fz + Math.sin(a) * 30.0, -a + PI / 2), c: i % 2 ? sc : sc2, us: [1.6, 1.4]
+        geo: new THREE.BoxGeometry(wSeg, hgt, 7.0),
+        m: TRS(px, fTop - hgt * 0.5, pz, -a + PI / 2), cy: PW, us: [wSeg / 2.6, hgt / 2.6]
+      });
+      st.push({
+        geo: new THREE.BoxGeometry(wSeg * 1.03, hgt * 0.55, 9.4),
+        m: TRS(px + ca * 1.3, fTop - 5.0 - hgt * 0.275, pz + sa * 1.3, -a + PI / 2),
+        cy: PW2, us: [wSeg / 2.6, hgt / 5.0]
+      });
+      // parapet cap + string course, on the level all the way round
+      st.push({
+        geo: new THREE.BoxGeometry(wSeg, 1.5, 7.8),
+        m: TRS(px, fTop + 0.75, pz, -a + PI / 2), cy: PW2, us: [wSeg / 2.6, 0.6]
+      });
+      /* TERRACE. A second, lower ring of piers standing 6 m clear of the curtain,
+         each snapped to its own ground: this is the cut-and-fill skirt that puts
+         the fort ON the hill rather than beside it, and it is what breaks the
+         silhouette into two stepped masses instead of one card.              */
+      const tx = fx + ca * RT, tz = fz + sa * RT;
+      const wT = 2 * PI * RT / NSEC * 1.20;
+      const gT = groundUnder(tx, tz, wT * 0.5);
+      // only build the terrace where there is ground within reach to stand on
+      if (gT > fy - 26.0) {
+        const tTop = Math.min(fTop - 6.0, gT + 4.5);
+        const hT = tTop - (gT - 12.0);
+        st.push({
+          geo: new THREE.BoxGeometry(wT, hT, 7.0),
+          m: TRS(tx, tTop - hT * 0.5, tz, -a + PI / 2),
+          cy: weather(lin(0xd8cdb4), 0.70, fy - 16, fy + 4), us: [wT / 2.8, hT / 2.8]
+        });
+      }
+    }
+    // crenellation: alternating merlon depth so the crest is not a ruled strip
+    for (let i = 0; i < 36; i++) {
+      const a = i / 36 * 6.283 + 0.08;
+      const dp = 1.30 + (i % 3) * 0.32, hh = 1.8 + (i % 4) * 0.28;
+      st.push({
+        geo: new THREE.BoxGeometry(2.4, hh, dp),
+        m: TRS(fx + Math.cos(a) * (RW + 1.6), fTop + 1.5 + hh * 0.5, fz + Math.sin(a) * (RW + 1.6), -a + PI / 2),
+        cy: i % 2 ? PW : PW2, us: [1.5, 1.2]
       });
     }
-    // inner keep + magazine
-    st.push({ geo: new THREE.BoxGeometry(17, 7.5, 12), m: TRS(fx + 2, fy + 8.0, fz - 3, 0.22), c: sc, us: [5, 2.5] });
-    st.push({ geo: new THREE.BoxGeometry(9, 4.6, 7), m: TRS(fx - 13, fy + 6.6, fz + 9, -0.4), c: sc2, us: [3, 1.6] });
+    // inner keep + magazine, standing proud of the parapet so the roofline breaks
+    st.push({ geo: new THREE.BoxGeometry(14, 20.0, 10.5), m: TRS(fx + 1.5, fTop + 2.6 - 10.0, fz - 2.5, 0.22), cy: PW, us: [4.5, 6.5] });
+    st.push({ geo: new THREE.BoxGeometry(15.4, 0.9, 11.9), m: TRS(fx + 1.5, fTop + 3.1, fz - 2.5, 0.22), cy: PW2, us: [4.5, 0.4] });
+    st.push({ geo: new THREE.BoxGeometry(7, 16.0, 5.5), m: TRS(fx - 9, fTop - 0.8 - 8.0, fz + 7, -0.4), cy: PW2, us: [3, 5] });
+    // the fort sits ON the hill: darken the ground it stands on
+    stampCover(fx, fz, 48, 0.44);
     // cannon on the seaward embrasures
     for (let i = 0; i < 5; i++) {
       const a = PI * (0.62 + i * 0.11);
-      const cxp = fx + Math.cos(a) * 26, czp = fz + Math.sin(a) * 26;
-      st.push({ geo: new THREE.CylinderGeometry(0.17, 0.23, 2.6, 8), m: TRS(cxp, fy + 11.6, czp, -a + PI / 2, 1, 1, 1, PI / 2 - 0.12), c: lin(0x33302c) });
-      st.push({ geo: new THREE.BoxGeometry(1.3, 0.5, 2.0), m: TRS(cxp, fy + 11.0, czp, -a + PI / 2), c: lin(0x5b4630) });
+      // inboard of the curtain (the wall occupies radius RW-3.5 .. RW+3.5)
+      const cxp = fx + Math.cos(a) * (RW - 5.0), czp = fz + Math.sin(a) * (RW - 5.0);
+      st.push({ geo: new THREE.CylinderGeometry(0.17, 0.23, 2.6, 8), m: TRS(cxp, fTop + 2.4, czp, -a + PI / 2, 1, 1, 1, PI / 2 - 0.12), c: lin(0x33302c) });
+      st.push({ geo: new THREE.BoxGeometry(1.3, 0.5, 2.0), m: TRS(cxp, fTop + 1.8, czp, -a + PI / 2), c: lin(0x5b4630) });
     }
     // flagstaff
-    st.push({ geo: new THREE.CylinderGeometry(0.11, 0.14, 15, 6), m: TRS(fx + 2, fy + 19, fz - 3, 0), c: lin(0xdad6cc) });
-    st.push({ geo: new THREE.PlaneGeometry(2.6, 1.6), m: TRS(fx + 3.4, fy + 25.2, fz - 3, 0), c: lin(0xc8332a) });
+    st.push({ geo: new THREE.CylinderGeometry(0.11, 0.14, 15, 6), m: TRS(fx + 1.5, fTop + 10.6, fz - 2.5, 0), c: lin(0xdad6cc) });
+    st.push({ geo: new THREE.PlaneGeometry(2.6, 1.6), m: TRS(fx + 2.9, fTop + 16.8, fz - 2.5, 0), c: lin(0xc8332a) });
     const fortMat = solidMat(TEX.stone, 0, { rough: 0.86, f0: 0.03, detS: 1.1, detA: 0.6, side: THREE.DoubleSide });
     add(scene, new THREE.Mesh(merge(st), fortMat));
 
@@ -1792,7 +3056,10 @@
        Nothing on a bare hillside tells you whether it is 60 m or 600 m high.
        A lattice mast of known height on the ridge, and a stone jetty at the
        waterline, calibrate the whole massif at a cost of a few hundred verts. */
-    const mx = 238, mz = -722, my = I.heightAt(mx, mz);
+    const mx = 238, mz = -722;
+    let my = I.heightAt(mx, mz);
+    for (let a = 0; a < 6.283; a += 0.5) my = Math.min(my, I.heightAt(mx + Math.cos(a) * 22, mz + Math.sin(a) * 22));
+    my -= 2.5;
     const mc = lin(0xb9bcbe), mr = lin(0xc4402f);
     for (let s = 0; s < 4; s++) {
       const a = s / 4 * 6.283 + 0.78, r0 = 1.9, r1 = 0.55;
@@ -2298,13 +3565,22 @@
     TEX.leaf = leafTexture();
     U.uDet.value = TEX.detail;
 
-    bakeField();
-    bakeCover();
-    buildTerrain(scene, hi);
+    // one-time bake budget, published so the cost of the terrain resolution is
+    // measurable instead of guessed at
+    const _t = []; const _mk = n => _t.push([n, performance.now()]);
+    _mk('tex');
+    bakeField(); _mk('field');
+    // contour streets must exist BEFORE the cover bake: they are what the road
+    // mask and the settlement weighting are drawn from
+    buildContourRoads(); _mk('roads');
+    bakeCover(); _mk('cover');
+    buildTerrain(scene, hi); _mk('terrain');
     buildMarina(scene);
     buildChannel();
-    buildTown(scene, hi);
-    buildVegetation(scene, hi);
+    buildTown(scene, hi); _mk('town');
+    buildVegetation(scene, hi); _mk('veg');
+    I.buildMs = {};
+    for (let i = 1; i < _t.length; i++) I.buildMs[_t[i][0]] = Math.round(_t[i][1] - _t[i - 1][1]);
     buildFleet(scene, (SAIL.opts && SAIL.opts.reserved) || []);
     buildShoreReflection(scene);
     // the contact-shading channel is stamped while placing, so re-upload once
@@ -2362,10 +3638,17 @@
     U.uSunE.value = sunE; U.uSkyE.value = skyE;
     const up = clamp(el, 0, 1);
     U.uSkyCol.value.setRGB(lerp(0.30, 0.36, up), lerp(0.36, 0.55, up), lerp(0.62, 0.95, up));
-    U.uHazeCol.value.setRGB(lerp(0.68, 0.560, up), lerp(0.58, 0.745, up), lerp(0.58, 1.000, up));
+    // the in-scatter colour has to be measurably BLUE, not a neutral grey veil:
+    // a hazed 3 km ridge that greys instead of blueing reads as bare rock
+    U.uHazeCol.value.setRGB(lerp(0.68, 0.470, up), lerp(0.58, 0.690, up), lerp(0.58, 1.060, up));
     // the Rayleigh veil goes warm-mauve as the sun drops, blue when it is high
     U.uRayCol.value.setRGB(lerp(0.74, 0.42, up), lerp(0.50, 0.56, up), lerp(0.48, 0.92, up));
     U.uTime.value = t;
+    // detail band-limit follows the lens, referenced to the tuned 46 deg default
+    const _cam = SAIL.camera;
+    if (_cam && _cam.isPerspectiveCamera && _cam.fov > 0.5) {
+      U.uPixA.value = 0.0021 * Math.tan(_cam.fov * PI / 360) / PIXA_REF;
+    }
     // wind (world-space, m/s) -> sway direction and strength
     const wx = (E.windX !== undefined ? E.windX : 0.7), wz = (E.windZ !== undefined ? E.windZ : 0.7);
     const ws = Math.hypot(wx, wz) || 1;
@@ -2388,9 +3671,33 @@
        overlapping planes. The old constant was not far off — what killed the
        aerial perspective was the DARK, NEUTRAL inscatter colour and the total
        absence of chroma loss, both fixed in fogApply.                        */
-    U.uHaze.value = 1.0 / (1250 + vis * 33);
-    U.uHazeR.value = 1.0 / (7000 + vis * 190);
+    /* Retuned against uFogH = 900 (see the uniform block). With the old 110 m
+       scale height the coefficient had to be large to get ANY haze onto a
+       summit, and that same coefficient then buried the shoreline. At 900 m the
+       height term is nearly flat, so the coefficient sets pure distance falloff
+       and the ladder comes out monotone: the 1.3 km near shore lands near 22%
+       inscatter, the 3 km peak behind it near 37%, the 8 km headlands near 67%.
+       That ordering — near sharp, far dissolving — is the whole depth read.  */
+    /* Against uFogH = 1400 the ladder now reads: 700 m near ridge ~28%, 1.3 km
+       shoreline ~45%, 3 km peak ~75%, 8 km headlands ~97% — i.e. the far end of
+       the massif genuinely dissolves into the horizon sky instead of standing
+       out of it. This is the single term that turns the island from a cutout at
+       one depth into a stack of separable overlapping planes.                 */
+    U.uHaze.value = 1.0 / (1500 + vis * 26);
+    U.uHazeR.value = 1.0 / (7200 + vis * 190);
     U.uCloudAmt.value = clamp(E.cloudCover === undefined ? 0.42 : E.cloudCover, 0, 1);
+    // rig cascade: bind whatever app.js committed for this frame
+    const RS = SAIL.rigShadow;
+    if (RS && RS.on && RS.map) {
+      U.uRigMap.value = RS.map;
+      U.uRigMat.value.copy(RS.matrix);
+      U.uRigTexel.value = RS.texel;
+      U.uRigBias.value = RS.bias;
+      U.uRigStr.value = RS.strength;
+      U.uRigOn.value = 1;
+    } else {
+      U.uRigOn.value = 0;
+    }
     if (nightLightMat) nightLightMat.uniforms.uEmis.value = U.uNight.value * 160.0;
   }
   I.update = function (t, dt) {

@@ -18,6 +18,22 @@
    13.8 ms but p99 was 34-46 ms: the probe alone dropped a frame twice a
    second. Three cadence governors below fix it without touching the look.
 
+   RE-MEASURED after the water/sky/island rework, GPU-inclusive (N frames
+   pipelined against one readPixels fence), renderScale 1.25 = 1600x1000:
+
+     cockpit-noon 27.9   cockpit-golden 22.8   ocean-close  31.8
+     ocean-horizon 29.8  sails-upwind   26.1   island-appr. 29.5
+     night 40.5                                          ms/frame
+
+   NOTHING holds 60 fps at a pinned 1600x1000 any more. The ocean's own pass
+   is now the budget: measured by rendering the frame with and without the
+   water layer it costs 13.9 ms in cockpit-noon and 22.0 ms in ocean-close,
+   i.e. 50-66% of the whole frame. The RESOLUTION governor is what carries
+   this — cockpit-noon measures 27.5 / 20.2 / 15.8 / 13.9 ms at renderScale
+   1.25 / 1.00 / 0.85 / 0.75, so 60 fps returns at 0.85 (1088x680) and the
+   [0.75, 1.25] range is still the right one. If the water pass is ever made
+   cheaper, raise the floor before adding anything else to the frame.
+
      * SHADOWS   the sun moves 0.004 deg and the boat 7 cm per frame; there is
                  no information in a 60 Hz shadow map. 30 Hz (20 Hz on 'low'),
                  forced when the sun, quality or frame size actually change.
@@ -48,6 +64,40 @@
     var d = want - cur, m = rate * dt;
     return Math.abs(d) <= m ? want : cur + (d > 0 ? m : -m);
   }
+
+  /* ---- 0.  DIAGNOSTIC LOG -------------------------------------------------
+     Every module builds itself inside app's build() and reports trouble by
+     console.warn ("partial build: ..."), while three reports a failed shader
+     link by console.error. Both are invisible to an automated check, because a
+     devtools console is a rolling scrollback shared across page loads: there is
+     no way to tell an error raised by THIS load from one raised ten reloads
+     ago. So mirror both channels into a per-load array. Installed at parse time
+     of app.js, which is the last script tag — every module's top level has run,
+     and everything that follows (build, shot, settle, render) is captured.
+     Pass-through is unconditional: this only ever adds a record. */
+  var diagLog = [];
+  (function () {
+    if (!window.console) return;
+    ['error', 'warn'].forEach(function (lvl) {
+      var orig = console[lvl];
+      if (typeof orig !== 'function') return;
+      console[lvl] = function () {
+        try {
+          var parts = [], i;
+          for (i = 0; i < arguments.length; i++) {
+            var a = arguments[i];
+            parts.push(a && a.stack ? String(a.stack) : String(a));
+          }
+          var s = parts.join(' ');
+          // three's own r150 UMD deprecation notice is expected and not ours
+          if (s.indexOf('are deprecated with r150+') < 0 && diagLog.length < 400) {
+            diagLog.push({ level: lvl, msg: s.length > 4000 ? s.slice(0, 4000) : s });
+          }
+        } catch (e) { /* a logger must never be the thing that throws */ }
+        return orig.apply(console, arguments);
+      };
+    });
+  })();
 
   var errBox = null;
   function fail(where, e) {
@@ -200,7 +250,7 @@
   /* ---- 3b. FRAME BUDGET GOVERNORS ----------------------------------------- */
 
   /* ---------------------------------------------------------- shadows ---- */
-  var shadowGov = { every: 2, n: 0, pending: true, sunY: 9, sunX: 9, light: null };
+  var shadowGov = { every: 2, n: 0, pending: true, willDraw: true, sunY: 9, sunX: 9, light: null };
   function forceShadow() { shadowGov.pending = true; shadowGov.n = 0; }
 
   function sunLight() {
@@ -227,7 +277,12 @@
   /* Only worth redrawing when the light or the casters moved by more than a
      texel. The sun moves 15 deg per SIMULATED hour, so scrubbing the clock has
      to force it; free-running does not. */
-  function stepShadowGov() {
+  /* Split in two on purpose. decide() has to run EARLY — before ocean, island
+     and sails bind the cascade — because those consumers must be handed the
+     same fit the depth pass will draw with; one frame of skew and the
+     projected rig swims across the water. arm() stays LATE so the gate cannot
+     be consumed by the reflection probe's six cube faces. */
+  function decideShadowGov() {
     var sd = SAIL.sky && SAIL.sky.sunDir;
     if (sd && fin(sd.x)) {
       if (Math.abs(sd.y - shadowGov.sunY) > 6e-4 || Math.abs(sd.x - shadowGov.sunX) > 6e-4) {
@@ -235,7 +290,181 @@
       }
     }
     if (++shadowGov.n >= shadowGov.every) { shadowGov.n = 0; shadowGov.pending = true; }
+    shadowGov.willDraw = shadowGov.pending;
+    return shadowGov.willDraw;
+  }
+  function armShadowGov() {
     if (shadowGov.pending) { renderer.shadowMap.needsUpdate = true; shadowGov.pending = false; }
+  }
+
+  /* ------------------------------------------------- THE RIG CASCADE ----- */
+  /* One sun-space depth target, owned here, serving four consumers:
+       - the yacht, through three's own injected shadowmap chunks;
+       - js/sails.js, through its existing manual shadowAt() lookup;
+       - js/ocean.js and js/island.js, through the same lookup added there.
+     sky.js allocates the light and re-places it every frame inside its own
+     updateLights(); everything below deliberately runs AFTER that and stamps
+     over it, because sky.js' framing cannot work:
+       ortho +-30 m, near 1 / far 260, light 180 m out.
+     The cross-sun extent is the only thing that has to contain the CASTERS —
+     a water point 250 m downsun of the masthead has the same light-space x/y
+     as the masthead itself, and differs only in DEPTH. So the fix is not a
+     bigger box, it is a tight box (+-~18 m => 1.7 cm texels, better than the
+     old 2.9 cm) with a near/far pair stretched along the sun ray far enough
+     to contain the water the rig's shadow actually lands on. That reach is
+     mastHeight / sunDir.y, i.e. ~245 m at 5 deg — one line, and it is the
+     whole reason the golden-hour shots had no shadow on the sea.
+     three's shadow map is RGBA-PACKED depth (~24 usable bits), not a 16-bit
+     depth texture, so a 250 m range costs nothing in precision; that is also
+     what lets every consumer unpack it by hand with the same upk().
+     Commit discipline: the map is only re-rendered on the shadowGov's gate,
+     so the camera is only re-fitted on those frames too and is replayed
+     verbatim in between. Map and matrix therefore always agree — otherwise
+     the projection swims by half a frame of boat motion. */
+  var rigSh = {
+    on: 0, map: null, texel: 1 / 2048, bias: 0.0008, strength: 0,
+    matrix: new T.Matrix4(), dir: new T.Vector3(0, 1, 0),
+    radius: 18, near: 1, far: 260, reach: 0,
+    pos: new T.Vector3(), ctr: new T.Vector3(), fitted: false
+  };
+  SAIL.rigShadow = rigSh;
+
+  var _rsBox = new T.Box3(), _rsC = new T.Vector3(), _rsR = new T.Vector3(),
+      _rsU = new T.Vector3(), _rsD = new T.Vector3(), _rsRef = new T.Vector3(),
+      _rsFitAge = 1e9, _rsExt = { r: 12, yLo: -2, yHi: 24 };
+
+  /* The rig's own extent, remeasured at 2 Hz. Cheap (Box3.setFromObject uses
+     each geometry's cached bounding box) and it has to be measured rather than
+     assumed, because the boom swings, the genoa furls and the main reefs. */
+  function fitRigExtent(dt) {
+    _rsFitAge += dt;
+    var g = yacht && yacht.group;
+    if (!g) return;
+    if (_rsFitAge < 0.5 && _rsExt.r > 0) return;
+    _rsFitAge = 0;
+    try { _rsBox.setFromObject(g); } catch (e) { return; }
+    if (_rsBox.isEmpty()) return;
+    var bx = SAIL.boat && fin(SAIL.boat.x) ? SAIL.boat.x : (_rsBox.min.x + _rsBox.max.x) * 0.5;
+    var bz = SAIL.boat && fin(SAIL.boat.z) ? SAIL.boat.z : (_rsBox.min.z + _rsBox.max.z) * 0.5;
+    var rx = Math.max(Math.abs(_rsBox.max.x - bx), Math.abs(bx - _rsBox.min.x));
+    var rz = Math.max(Math.abs(_rsBox.max.z - bz), Math.abs(bz - _rsBox.min.z));
+    if (!fin(rx) || !fin(rz)) return;
+    _rsExt.r = clamp(Math.hypot(rx, rz), 6, 40);
+    _rsExt.yLo = clamp(_rsBox.min.y, -12, 2);
+    _rsExt.yHi = clamp(_rsBox.max.y, 4, 60);
+  }
+
+  /* Which way the key light is pointing, taken from the same source sky.js
+     uses rather than from the light itself — reading the light back would
+     just return whatever this module stamped on it last frame, and the
+     cascade would never track the sun at all. */
+  function keyDir(out) {
+    var S = SAIL.sky;
+    var sd = S && S.sunDir, md = S && S.moonDir;
+    if (sd && fin(sd.x)) {
+      if (sd.y < 0.005 && md && fin(md.x) && md.y > 0.02) out.copy(md);
+      else out.copy(sd);
+      if (out.lengthSq() > 1e-6) return out.normalize();
+    }
+    return out.set(0.2, 0.97, 0.1).normalize();
+  }
+
+  function updateRigShadow(dt, applyOnly) {
+    var L = sunLight();
+    if (!L || !L.shadow || !L.shadow.camera) { rigSh.on = 0; return; }
+    if (!applyOnly) fitRigExtent(dt);
+
+    keyDir(_rsD);
+
+    var refit = !applyOnly &&
+      (shadowGov.willDraw || renderer.shadowMap.autoUpdate || !rigSh.fitted);
+    if (refit) {
+      rigSh.dir.copy(_rsD);
+      var hi = _rsExt.yHi, lo = _rsExt.yLo;
+      var half = (hi - lo) * 0.5;
+      _rsC.set(0, (hi + lo) * 0.5, 0);
+      if (SAIL.boat && fin(SAIL.boat.x)) { _rsC.x = SAIL.boat.x; _rsC.z = SAIL.boat.z; }
+      else if (env.camPos) { _rsC.x = env.camPos.x; _rsC.z = env.camPos.z; }
+
+      // bounding sphere of the rig about that centre: rotation invariant, so
+      // the box never has to be re-fitted just because the boat yawed
+      /* Quantised to 2 m. The extent is remeasured from a live Box3 twice a
+         second and the boom swings, the genoa furls and the cloth flaps, so an
+         un-quantised R would resize the ortho — and therefore the texel — on
+         every refit, which re-lands the snap on a different lattice and puts
+         the crawl straight back. */
+      var R = clamp(Math.ceil((Math.hypot(_rsExt.r, half) + 1.5) * 0.5) * 2, 8, 64);
+      var msz = Math.max(L.shadow.mapSize.x, 1);
+      var texel = 2 * R / msz;
+
+      // light basis, matching Object3D.lookAt: z = normalize(eye-target)
+      _rsRef.set(0, 1, 0);
+      if (Math.abs(_rsD.y) > 0.985) _rsRef.set(0, 0, 1);
+      _rsR.crossVectors(_rsRef, _rsD).normalize();
+      _rsU.crossVectors(_rsD, _rsR);
+      // snap the centre onto the shadow texel lattice along the light's own
+      // right/up axes — this, not the world-axis snap sky.js does, is what
+      // stops the silhouette crawling as the boat moves
+      var a = _rsC.dot(_rsR), b = _rsC.dot(_rsU);
+      var da = Math.round(a / texel) * texel - a;
+      var db = Math.round(b / texel) * texel - b;
+      _rsC.addScaledVector(_rsR, da).addScaledVector(_rsU, db);
+
+      /* How far down the sun ray the rig's shadow can still land on water.
+         Guarded at 0.045 (2.6 deg) so a setting sun cannot ask for a 3 km
+         frustum; 520 m is already twice the length of anything legible. */
+      var reach = clamp((hi - Math.min(lo, 0.0)) / Math.max(_rsD.y, 0.045), 0, 520);
+      var D = R + 20;
+      rigSh.radius = R;
+      rigSh.reach = reach;
+      rigSh.near = Math.max(D - R - 4, 0.5);
+      rigSh.far = D + R + reach + 12;
+      rigSh.ctr.copy(_rsC);
+      rigSh.pos.copy(_rsD).multiplyScalar(D).add(_rsC);
+      rigSh.texel = 1 / msz;
+      rigSh.fitted = true;
+    }
+
+    /* Replay the committed fit over whatever sky.js just wrote. Done every
+       frame, not only on refit frames, so the light cannot drift away from
+       the depth map that is still on the GPU. */
+    var c = L.shadow.camera, R2 = rigSh.radius;
+    if (c.left !== -R2 || c.near !== rigSh.near || c.far !== rigSh.far) {
+      c.left = -R2; c.right = R2; c.top = R2; c.bottom = -R2;
+      c.near = rigSh.near; c.far = rigSh.far;
+      c.updateProjectionMatrix();
+    }
+    /* Bias, in NORMALISED ortho depth. sky.js ran -0.0006 over a 259 m range
+       = 155 mm, which deletes every occluder within 15 cm of its receiver —
+       i.e. all of the cockpit. Hold it at ~6 mm of world depth instead, and
+       drop normalBias from 45 mm (1.5 texels of peter-panning) to 8 mm. */
+    var span = Math.max(rigSh.far - rigSh.near, 1);
+    L.shadow.bias = -0.006 / span;
+    L.shadow.normalBias = 0.008;
+    /* Never toggled. sky.js flipped castShadow off below E=0.6, which both
+       killed the golden-hour shadows outright and forced three to recompile
+       ~70 materials each time NUM_DIR_LIGHT_SHADOWS changed. Fade the
+       strength uniform the consumers read instead. */
+    L.castShadow = true;
+    L.position.copy(rigSh.pos);
+    L.target.position.copy(rigSh.ctr);
+    L.updateMatrixWorld(true);
+    L.target.updateMatrixWorld(true);
+    try { L.shadow.updateMatrices(L); } catch (e) { }
+    rigSh.matrix.copy(L.shadow.matrix);
+    rigSh.map = (L.shadow.map && L.shadow.map.texture) ? L.shadow.map.texture : null;
+    rigSh.texel = 1 / Math.max(L.shadow.mapSize.x, 1);
+    rigSh.bias = 0.05 / span;                        // 5 cm, for the receivers
+    // no hard gate at the horizon: a 3 deg sun still throws the longest and
+    // most legible shadow of the day, it is simply softer
+    rigSh.strength = clamp((rigSh.dir.y - 0.005) / 0.075, 0, 1) * clamp(L.intensity * 0.6, 0, 1);
+    rigSh.on = (rigSh.map && rigSh.strength > 0.004) ? 1 : 0;
+    /* A/B leg for SAIL.diag.shadow(). Held here, at the very end and on
+       every frame, because the fit above is replayed each frame and would
+       otherwise put the strength straight back. Only the four SAIL.rigShadow
+       consumers (ocean, island, sails, and the deck via three's own chunks read
+       the light) see this; it is never set in normal running. */
+    if (rigSh.forceOff) { rigSh.strength = 0; rigSh.on = 0; }
   }
 
   /* ------------------------------------------- local reflection probe ---- */
@@ -337,7 +566,12 @@
   var gov = {
     buf: new Float32Array(72), n: 0, filled: 0, late: 0,
     scratch: new Float32Array(72),
-    scale: RSMAX, cool: 3.0, up: 0, enabled: true
+    // Start at 1.0, not RSMAX. Measured on a Radeon Pro 5300M, renderScale 1.25
+    // costs ~50 ms/frame (20 fps) while 'low' runs at 7 ms — so opening at the
+    // ceiling means everyone's first few seconds are a slideshow while the
+    // governor walks it back down. The governor climbs UP when there is real
+    // headroom, which is the right direction to be wrong in.
+    scale: 1.0, cool: 3.0, up: 0, enabled: true
   };
 
   function govSample(workMs, dt) {
@@ -463,10 +697,21 @@
      refraction copy it samples. Rebinding is one identity compare per frame. */
   var _oceanMesh = null;
   function bindOceanLayer() {
+    var wl = (SAIL.post && SAIL.post.layers) ? SAIL.post.layers.water : 1;
+    /* Re-assert the CAMERA side every frame, not just the mesh side.
+       post.js' refraction pass renders the opaque scene and the water in two
+       draws by writing camera.layers.mask twice and restoring it at the end.
+       If anything between those two points throws — or the frame is aborted
+       part-way, which is exactly what a debugger or a stalled tool call does —
+       the mask is left holding the OPAQUE half, water bit cleared. From then
+       on `waterMask` is 0 for every subsequent frame, post silently skips the
+       water pass, and the sea vanishes with no error anywhere: you see the
+       seabed and the sky dome instead. One bitmask test per frame buys
+       immunity to that whole class of failure. */
+    if (camera && camera.layers && !(camera.layers.mask & (1 << wl))) camera.layers.enable(wl);
     var O = SAIL.ocean;
     if (!O || !O.mesh || O.mesh === _oceanMesh) return;
     _oceanMesh = O.mesh;
-    var wl = (SAIL.post && SAIL.post.layers) ? SAIL.post.layers.water : 1;
     _oceanMesh.layers.set(wl);
   }
 
@@ -920,7 +1165,6 @@
   SAIL.physFaults = function () { return physFaults; };
 
   /* ---- 8.  PER-FRAME SUBSYSTEM GLUE --------------------------------------- */
-  var _sun = new T.Vector3(0, 1, 0);
   var wakeAcc = 0, wakePeriod = 1 / 30;
   var hudAcc = 0, hudPeriod = 0;
 
@@ -935,15 +1179,16 @@
 
     O.setFocus(boat.x, boat.z);
 
-    // hull shadow on the water, projected along the sun
+    /* Waterline contact darkening. This used to be the whole of the boat's
+       shadow on the sea: an 8.4 x 4.5 m ellipse smeared downsun, standing in
+       for a 20 m rig — the "oil slick" the review named. SAIL.rigShadow now
+       projects the real silhouette, so this is cut back to what it honestly
+       is: ambient occlusion in the few metres right against the topsides,
+       parked ON the hull rather than thrown downsun, and independent of sun
+       elevation because sky occlusion does not care where the sun is. */
     if (O.setHullShadow) {
-      var sd = (SAIL.sky && SAIL.sky.sunDir) || _sun;
-      var sy = Math.max(sd.y, 0.08);
-      var lift = 1.4;
-      var sx = boat.x - sd.x / sy * lift, sz = boat.z - sd.z / sy * lift;
       var sh = Math.sin(boat.heading), ch = Math.cos(boat.heading);
-      var str = clamp((sd.y - 0.03) * 3.0, 0, 1) * 0.85;
-      O.setHullShadow(sx, sz, 8.4, 4.5, sh, -ch, str);
+      O.setHullShadow(boat.x, boat.z, 8.2, 4.2, sh, -ch, 0.42);
     }
 
     // wake: one deposit per hull transom plus the bow waves, rate limited
@@ -1101,6 +1346,13 @@
 
     try { updateCamera(dt); } catch (e) { fail('camera', e); }
 
+    /* The cascade is fitted here, ahead of every consumer that binds it, and
+       ahead of sky.js' own updateLights() — which is deliberately stamped
+       over further down. sky.update() is late in this order, so re-stamp
+       after it too; both calls are idempotent on a non-refit frame. */
+    decideShadowGov();
+    try { updateRigShadow(dt); } catch (e) { fail('rigShadow', e); }
+
     try { feedOcean(dt); } catch (e) { fail('ocean.feed', e); }
     if (SAIL.ocean && SAIL.ocean.update) { try { SAIL.ocean.update(simT, dt, camera); } catch (e) { fail('ocean.update', e); } }
     bindOceanLayer();
@@ -1124,7 +1376,13 @@
 
     /* Last thing before the first renderer.render() of the frame, so the gate
        cannot be consumed by the reflection probe's cube faces. */
-    stepShadowGov();
+    armShadowGov();
+    /* sky.js' updateLights() ran inside SAIL.sky.update() above and put the
+       light back on its own ±30 m / near 1 / far 260 framing. Replay the
+       committed fit — apply only, no re-measurement, so the consumers that
+       already bound the matrix upstream stay in step with the depth map the
+       renderer is about to draw. */
+    try { updateRigShadow(dt, true); } catch (e) { fail('rigShadow', e); }
 
     feedPost();
     if (SAIL.post && SAIL.post.render) { try { SAIL.post.render(dt); } catch (e) { fail('post.render', e); } }
@@ -1265,6 +1523,13 @@
     }
     hudAcc = hudPeriod;                        // the next live frame repaints
     // 4. exposure: auto-adaptation has a 1.2 s / 3.0 s time constant
+    //    (the cascade first: autoUpdate is wide open here, so every settle
+    //     pass redraws the depth map and the fit has to be current)
+    try { rigSh.fitted = false; updateRigShadow(0.6); } catch (e) { }
+    if (SAIL.ocean && SAIL.ocean.update) SAIL.ocean.update(simT, 1 / 60, camera);
+    if (SAIL.island && SAIL.island.update) SAIL.island.update(simT, 1 / 60);
+    if (SAIL.sails && SAIL.sails.update) SAIL.sails.update(simT, 1 / 60, buildTrim());
+    try { updateRigShadow(0.0, true); } catch (e) { }
     feedPost();
     if (SAIL.post && SAIL.post.render) {
       for (i = 0; i < 9; i++) SAIL.post.render(0.6);
@@ -1341,10 +1606,138 @@
       fn();
       settle();
       if (SAIL.hud && SAIL.hud.setVisible) SAIL.hud.setVisible(true);
+      if (SAIL.diag) SAIL.diag._shot = String(name).toLowerCase();
       return true;
     } catch (e) { fail('shot:' + name, e); return false; }
   };
   SAIL.shots = Object.keys(SHOTS);
+
+  /* ---- 11b. DIAGNOSTICS ---------------------------------------------------
+     Primitives for an automated integration check. Deliberately thin: this
+     exposes the frame clock, the framebuffer and the shadow A/B leg, and lets
+     the caller do the statistics. Nothing here runs unless it is called. */
+  var diagBuf = null, diagW = 0, diagH = 0;
+  SAIL.diag = {
+    get log() { return diagLog; },
+    reset: function () { diagLog.length = 0; },
+
+    /* n frames of the real frame chain at a fixed dt, returning the wall-clock
+       cost of each. The governor is pinned off first: an adaptive renderScale
+       that moves mid-measurement makes the numbers meaningless. */
+    time: function (n, dt) {
+      n = n || 60; dt = dt || 1 / 60;
+      var keep = gov.enabled;
+      gov.enabled = false;
+      var i, ms = [];
+      for (i = 0; i < 12; i++) stepFrame(dt);            // warm caches + probe
+      for (i = 0; i < n; i++) {
+        var t0 = performance.now();
+        stepFrame(dt);
+        ms.push(performance.now() - t0);
+      }
+      gov.enabled = keep;
+      var srt = ms.slice().sort(function (a, b) { return a - b; });
+      var sum = 0; for (i = 0; i < ms.length; i++) sum += ms[i];
+      return {
+        n: n, mean: sum / ms.length,
+        p50: srt[(srt.length * 0.5) | 0],
+        p95: srt[Math.min(srt.length - 1, (srt.length * 0.95) | 0)],
+        max: srt[srt.length - 1],
+        quality: SAIL.quality,
+        internal: SAIL.post && SAIL.post.resolution ?
+          [SAIL.post.resolution.x, SAIL.post.resolution.y] : null,
+        w: renderer.domElement.width, h: renderer.domElement.height
+      };
+    },
+
+    /* The composited front buffer, straight off the default framebuffer. The
+       renderer is built with preserveDrawingBuffer, so this is valid at any
+       time and does not have to race the compositor. readPixels hands back
+       rows bottom-up; row 0 is the BOTTOM of the image. */
+    grab: function () {
+      var gl = renderer.getContext();
+      var c = renderer.domElement;
+      diagW = c.width; diagH = c.height;
+      var need = diagW * diagH * 4;
+      if (!diagBuf || diagBuf.length !== need) diagBuf = new Uint8Array(need);
+      renderer.setRenderTarget(null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.readPixels(0, 0, diagW, diagH, gl.RGBA, gl.UNSIGNED_BYTE, diagBuf);
+      SAIL.diag.buf = diagBuf;
+      return { w: diagW, h: diagH };
+    },
+
+    /* Force the rig cascade off (or back on) for every SAIL.rigShadow consumer
+       and redraw, so the same pixels can be compared with and without it. */
+    shadow: function (on) {
+      rigSh.forceOff = !on;
+      forceShadow();
+      var i;
+      for (i = 0; i < 3; i++) stepFrame(1 / 60);
+      return { forceOff: !!rigSh.forceOff, strength: rigSh.strength, reach: rigSh.reach, radius: rigSh.radius };
+    },
+
+    /* Integrate the boat alone for `secs` of model time with a randomised helm
+       and report whether the state stayed finite. No rendering, so it is fast
+       enough to cover ten simulated minutes in a single call. */
+    soak: function (secs, seed) {
+      if (!boat) return { ok: false, why: 'no boat' };
+      var s = (seed || 12345) >>> 0;
+      function rnd() { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }
+      var h = 1 / 60, n = Math.round((secs || 60) / h), i, bad = 0, worst = 0;
+      var kx = boat.x, kz = boat.z;
+      for (i = 0; i < n; i++) {
+        if ((i % 90) === 0) {
+          if (boat.setRudder) boat.setRudder((rnd() * 2 - 1) * 28);
+          env.windKn = 4 + rnd() * 32; syncEnvVectors();
+        }
+        boat.step(h, env);
+        if (!fin(boat.x) || !fin(boat.z) || !fin(boat.u) || !fin(boat.heelRad) || !fin(boat.hdg)) { bad++; break; }
+        worst = Math.max(worst, Math.abs(boat.heelRad));
+      }
+      var out = {
+        ok: bad === 0, steps: i, secs: i * h,
+        x: boat.x, z: boat.z, u: boat.u, spdKn: boat.u * KN,
+        heelDeg: boat.heelRad * R2D, maxHeelDeg: worst * R2D,
+        moved: Math.hypot(boat.x - kx, boat.z - kz)
+      };
+      return out;
+    },
+
+    /* The polar curve straight out of the physics model, so a regression in the
+       force balance shows up as a number rather than as a slow boat. */
+    polars: function (tws) {
+      var P = SAIL.physics;
+      if (!P || !P.polarDetail) return null;
+      var out = [], a;
+      for (a = 30; a <= 180; a += 10) {
+        var d = null;
+        try { d = P.polarDetail(a, tws || 14); } catch (e) { d = null; }
+        out.push({ twa: a, kn: d && fin(d.spd) ? +(d.spd).toFixed(2) : null,
+                   heel: d && fin(d.heelDeg) ? +(d.heelDeg).toFixed(1) : null });
+      }
+      return out;
+    },
+
+    state: function () {
+      return {
+        shot: SAIL.diag._shot || null,
+        quality: SAIL.quality,
+        internal: SAIL.post && SAIL.post.resolution ?
+          [SAIL.post.resolution.x, SAIL.post.resolution.y] : null,
+        w: renderer.domElement.width, h: renderer.domElement.height,
+        oceanSelfTest: SAIL.ocean ? SAIL.ocean.selfTestError : null,
+        rig: { on: rigSh.on, strength: rigSh.strength, radius: rigSh.radius,
+               reach: rigSh.reach, near: rigSh.near, far: rigSh.far },
+        boat: boat ? { x: boat.x, z: boat.z, spdKn: boat.u * KN, heelDeg: boat.heelRad * R2D,
+                       hdgDeg: boat.hdg, sailsUp: !!boat.sailsUp,
+                       finite: fin(boat.x) && fin(boat.z) && fin(boat.u) && fin(boat.heelRad) } : null,
+        env: { windKn: env.windKn, hourOfDay: env.hourOfDay, swellM: env.swellM, cloudCover: env.cloudCover },
+        drawCalls: renderer.info.render.calls, tris: renderer.info.render.triangles,
+        programs: renderer.info.programs ? renderer.info.programs.length : -1
+      };
+    }
+  };
 
   /* ---- 12.  BOOT ---------------------------------------------------------- */
   function dismissOverlay(startAudio) {

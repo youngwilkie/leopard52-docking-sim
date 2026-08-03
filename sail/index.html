@@ -148,15 +148,24 @@
 <div id="err"></div>
 
 <script src="vendor/three.min.js"></script>
-<script src="js/sky.js?v=5"></script>
-<script src="js/ocean.js?v=5"></script>
-<script src="js/island.js?v=5"></script>
-<script src="js/yacht.js?v=5"></script>
-<script src="js/sails.js?v=5"></script>
-<script src="js/physics.js?v=5"></script>
-<script src="js/post.js?v=5"></script>
-<script src="js/hud.js?v=5"></script>
-<script src="js/app.js?v=5"></script>
+<script>
+/* The static host sends Last-Modified and nothing else, so Chrome applies
+   heuristic freshness and will happily run a module it fetched several edits
+   ago — which shows up as a shader that fails to compile against source that
+   no longer exists on disk. Stamp every module with the page's own ?cb= (or
+   ?v=) token so a cache-busted URL busts the whole app, not just the shell.
+   document.write keeps these strictly ordered and synchronous, exactly as the
+   static tags were: js/app.js still runs last, after every module. */
+(function () {
+  var m = /[?&](?:cb|v)=([^&]*)/.exec(location.search);
+  var v = m ? decodeURIComponent(m[1]) : 'r13';
+  var mods = ['sky', 'ocean', 'island', 'yacht', 'sails', 'physics', 'post', 'hud', 'app'];
+  for (var i = 0; i < mods.length; i++) {
+    document.write('<scr' + 'ipt src="js/' + mods[i] + '.js?v=' +
+                   encodeURIComponent(v) + '"></scr' + 'ipt>');
+  }
+})();
+</script>
 
 </body>
 </html>

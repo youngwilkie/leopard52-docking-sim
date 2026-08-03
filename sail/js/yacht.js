@@ -158,10 +158,47 @@
      pattern reads as wallpaper the moment the eye tracks along it; the
      per-plank jitter plus the object-space wear mask in the material patch
      (see patchMat) is what breaks that up. */
+  /* REWRITTEN.  The previous layout was eight planks of identical width on a
+     perfectly regular pitch, with a caulk line that was a zero-width strip of
+     near-black paint.  Two consequences, both of which the review named:
+
+       - a constant pitch is a RULER.  The moment more than a metre of deck is
+         in frame the eye locks onto the repeat and reads the whole sole as one
+         tiled bitmap, however good the grain inside each plank is.
+       - a painted caulk line has no specular.  Real caulk is a rubber bead
+         squeezed proud of a chamfered plank edge: it sits in a 2 mm trough,
+         it crowns in the middle, and because polysulphide is far smoother
+         than holystoned teak it catches a thin bright sliver down its whole
+         length.  That sliver is most of what makes a laid deck look laid.
+
+     So: plank widths jitter +-8% and are laid out cumulatively (no two seams
+     land on the same pitch anywhere in the tile), the caulk carries a real
+     height profile with its own roughness, every plank gets a cross-grain ray
+     figure and open pores, and butt joints are finished with a pair of bungs
+     the way a screwed deck actually is. */
   function teakFields(S2) {
-    var NP = 8, pw = S2 / NP, x, y;
-    var G = new Float32Array(S2 * S2);
-    var ph = [], tone = [], rgh = [], slv = [], off = [], i;
+    var NP = 8, x, y, i;
+    /* ---- plank layout: cumulative, jittered, normalised back onto the tile */
+    var wj = [], sum = 0;
+    for (i = 0; i < NP; i++) { wj.push(1 + 0.16 * (hash1(i * 4.13 + 0.9) - 0.5)); sum += wj[i]; }
+    var edge = [0];
+    for (i = 0; i < NP; i++) edge.push(edge[i] + wj[i] / sum * S2);
+    edge[NP] = S2;
+    // per-pixel plank index, fractional position and signed distance to the
+    // nearest seam centre, precomputed so the three passes below agree exactly
+    var pIdx = new Uint8Array(S2), pFrc = new Float32Array(S2), pDst = new Float32Array(S2);
+    var k = 0;
+    for (x = 0; x < S2; x++) {
+      while (k < NP - 1 && x >= edge[k + 1]) k++;
+      pIdx[x] = k;
+      var w = edge[k + 1] - edge[k];
+      pFrc[x] = (x - edge[k]) / w;
+      var dL = x - edge[k], dR = edge[k + 1] - x;
+      pDst[x] = Math.min(dL, dR);                     // pixels to the nearest seam
+    }
+    var pw = S2 / NP;                                  // nominal, for callers
+    var G = new Float32Array(S2 * S2), CG = new Float32Array(S2 * S2);
+    var ph = [], tone = [], rgh = [], slv = [], off = [];
     for (i = 0; i < NP; i++) {
       ph.push(hash1(i * 3.7 + 1.3) * 400);            // grain phase
       off.push(hash1(i * 9.1 + 5.7));                 // butt-joint stagger
@@ -170,26 +207,82 @@
       slv.push(hash1(i * 21.7 + 4.4));                // how silvered this plank is
     }
     for (y = 0; y < S2; y++) for (x = 0; x < S2; x++) {
-      var pi = Math.floor(x / pw);
-      G[y * S2 + x] = fbm(x * 0.42 + ph[pi], y * 0.055 + ph[pi] * 0.3, 3, 0) * 0.75 +
-                      vn(x * 1.9 + ph[pi], y * 0.11, 0) * 0.25;
+      var pi = pIdx[x];
+      var o = y * S2 + x;
+      G[o] = fbm(x * 0.42 + ph[pi], y * 0.055 + ph[pi] * 0.3, 3, 0) * 0.75 +
+             vn(x * 1.9 + ph[pi], y * 0.11, 0) * 0.25;
+      /* CROSS-GRAIN.  Quarter-sawn teak carries medullary rays and a ribbon
+         figure that runs ACROSS the plank at a shallow angle, plus open pores
+         a fraction of a millimetre wide.  Grain drawn as a pure 1D vertical
+         streak is the single most synthetic thing a wood shader can do — it
+         is the one axis real timber never has. */
+      var ray = vn((x + y * 0.22) * 0.85 + ph[pi], y * 0.020, 0);
+      var pore = vn(x * 3.30 + ph[pi] * 2.0, y * 0.42, 0);
+      CG[o] = (ray - 0.5) * 0.62 + clamp(pore - 0.62, 0, 1) * 1.9;
     }
-    function seam(px, py) {                      // 0 = wood, 1 = caulk
-      var fx = (px % pw) / pw;
-      // the caulk swells and shrinks by a couple of mm along its length
-      var w = 0.052 + 0.016 * vn(px * 0.02, py * 0.09, 0);
-      return (fx < w || fx > 1 - w) ? 1 : 0;
+    /* Caulk cross-section, in pixels from the seam centre.  0 = plank face,
+       1 = full caulk.  The bead itself is ~5 mm at this texel density. */
+    var CW = S2 / 190;                                 // caulk half-width, px
+    function seam(px, py) {
+      var d = pDst[((px % S2) + S2) % S2];
+      // the bead swells and shrinks by a millimetre along its length
+      var w = CW * (1.0 + 0.22 * (vn(px * 0.02, py * 0.09, 0) - 0.5));
+      return clamp((w - d) / 1.1 + 0.5, 0, 1);
     }
-    function butt(px, py) {                      // staggered plank ends
-      var pi = Math.floor(px / pw);
-      var jt = ((py / S2) + off[pi]) % 1;
-      return (jt < 0.006 || jt > 0.994 || Math.abs(jt - 0.5) < 0.006) ? 1 : 0;
+    /* HEIGHT of the joint: the plank edge is chamfered down into a trough and
+       the rubber crowns back up in the middle of it, so the section is a W.
+       This is what produces the thin bright line down the caulk instead of a
+       flat black stripe. */
+    function seamH(px, py) {
+      var d = pDst[((px % S2) + S2) % S2];
+      var w = CW * (1.0 + 0.22 * (vn(px * 0.02, py * 0.09, 0) - 0.5));
+      if (d > w * 2.1) return 0;
+      if (d > w) return -0.62 * (1 - clamp((d - w) / (w * 1.1), 0, 1));   // chamfer
+      var t = d / w;                                                       // 0 centre
+      return -0.62 + 0.40 * (1 - t * t);                                   // rubber crown
+    }
+    /* BUTT JOINTS.  One joint per plank per tile — 2.0 m apart, which is what
+       a laid deck actually uses — at a stochastic offset per plank row, so no
+       two rows line up and there is no lattice for the eye to find.  Returns
+       a COVERAGE in 0..1 so the joint blends into the wood instead of stamping
+       a hard-edged rectangle. */
+    function butt(px, py) {
+      var pi = pIdx[((px % S2) + S2) % S2];
+      var t = (py / S2) - off[pi];
+      t -= Math.floor(t);
+      var dv = Math.min(t, 1 - t) * S2;                    // pixels from the joint
+      var w = 1.55 + 0.60 * hash1(pi * 7.73 + 3.1);        // it is a sawn end, not a line
+      return clamp((w - dv) / 1.45, 0, 1);
+    }
+    /* BUNGS.  A screwed deck is plugged: two 10 mm teak bungs sit just inboard
+       of every butt, their end grain a shade darker than the plank and their
+       tops sanded flush.  Tiny, and completely diagnostic of laid teak. */
+    function bung(px, py) {
+      var xi = ((px % S2) + S2) % S2;
+      var pi = pIdx[xi];
+      var t = (py / S2) - off[pi];
+      t -= Math.floor(t);
+      var pw2 = edge[pi + 1] - edge[pi];
+      var cx = edge[pi] + pw2 * 0.5;
+      var r = pw2 * 0.155, best = 9;
+      for (var q = 0; q < 2; q++) {
+        var dv = (t - (q ? 0.020 : -0.020)) * S2;
+        var dx = xi - cx;
+        var dd = Math.sqrt(dx * dx + dv * dv);
+        if (dd < best) best = dd;
+      }
+      return clamp((r - best) / 1.4, 0, 1);
     }
     function grain(px, py) {
       return G[(((py % S2) + S2) % S2) * S2 + (((px % S2) + S2) % S2)];
     }
-    function plank(px) { return Math.floor(px / pw); }
-    return { NP: NP, pw: pw, seam: seam, butt: butt, grain: grain, plank: plank,
+    function cross(px, py) {
+      return CG[(((py % S2) + S2) % S2) * S2 + (((px % S2) + S2) % S2)];
+    }
+    function plank(px) { return pIdx[((px % S2) + S2) % S2]; }
+    function frac(px) { return pFrc[((px % S2) + S2) % S2]; }
+    return { NP: NP, pw: pw, seam: seam, seamH: seamH, butt: butt, bung: bung,
+             grain: grain, cross: cross, plank: plank, frac: frac,
              tone: tone, rgh: rgh, slv: slv };
   }
   function texTeak() {
@@ -197,13 +290,13 @@
     var c = cvs(S2), g = c.getContext('2d'), im = g.createImageData(S2, S2), d = im.data;
     for (var y = 0; y < S2; y++) for (var x = 0; x < S2; x++) {
       var pi = F.plank(x);
-      var sm = F.seam(x, y), bt = F.butt(x, y), gr = F.grain(x, y);
+      var sm = F.seam(x, y), bt = F.butt(x, y), gr = F.grain(x, y), cr = F.cross(x, y);
       /* Albedo calibrated against a photograph of a laid deck in open shade:
          oiled teak sits around sRGB 165/138/100 and holystoned teak silvers
          to a warm grey near 185/180/166.  Anything below ~120 crushes to
          black the moment the deck is under a hardtop, which is exactly the
          "solid dark ribbon" failure. */
-      var l = (0.66 + 0.40 * gr) * F.tone[pi];
+      var l = (0.66 + 0.40 * gr) * F.tone[pi] * (1 - 0.16 * clamp(cr, 0, 1));
       var r = l * 232, gg = l * 196, b = l * 148;
       // UV silvering: sun-bleached planks lose the red and gain grey
       var sv = F.slv[pi] * clamp(gr * 1.3, 0, 1) * 0.62;
@@ -211,19 +304,38 @@
       // traffic lanes: the centre of the tile walks greyer than the edges
       var lane = Math.exp(-Math.pow((x / S2 - 0.5) / 0.34, 2)) * 0.32;
       r = lerp(r, 190, lane); gg = lerp(gg, 186, lane); b = lerp(b, 172, lane);
-      if (bt) { r *= 0.46; gg *= 0.46; b *= 0.48; }
-      if (sm) { r = 26; gg = 24; b = 22; }
+      // a bung is the same timber cut across the grain: darker, and flatter
+      var bg = F.bung(x, y);
+      if (bg > 0.004) { r = lerp(r, r * 0.80, bg); gg = lerp(gg, gg * 0.79, bg); b = lerp(b, b * 0.76, bg); }
+      // the butt is bedded in the same caulk as the seams, so it darkens
+      // toward the seam colour instead of simply multiplying to grey
+      if (bt > 0.004) { r = lerp(r, 34, bt * 0.86); gg = lerp(gg, 31, bt * 0.86); b = lerp(b, 28, bt * 0.88); }
+      /* Caulk is a warm dark GREY-BROWN rubber, not black paint, and its
+         crown catches enough light to sit a stop above its own shoulders. */
+      if (sm > 0.004) {
+        var cc = 40 + 16 * (1 - sm);
+        r = lerp(r, cc * 1.02, sm); gg = lerp(gg, cc * 0.95, sm); b = lerp(b, cc * 0.86, sm);
+      }
       var i = (y * S2 + x) * 4;
       d[i] = r; d[i + 1] = gg; d[i + 2] = b; d[i + 3] = 255;
     }
     g.putImageData(im, 0, 0);
     var alb = mkTex(c, true);
     var rgh = mkTex(grayCanvas(S2, function (x, y) {
-      if (F.seam(x, y)) return 0.92;
-      return clamp(0.40 + 0.14 * F.grain(x, y) + F.rgh[F.plank(x)], 0.15, 1);
+      /* THE SPECULAR SLIVER.  Cured polysulphide is a smooth rubber: it is
+         markedly GLOSSIER than the holystoned teak either side of it, not
+         rougher.  Setting the seam to 0.92 (as the previous version did) is
+         what made the caulk read as a painted line — it killed the only
+         highlight the joint could ever produce. */
+      var s = F.seam(x, y);
+      var wood = clamp(0.40 + 0.14 * F.grain(x, y) + F.rgh[F.plank(x)]
+                     + 0.10 * clamp(F.cross(x, y), 0, 1), 0.15, 1);
+      var caulk = 0.42;
+      return lerp(wood, caulk, s) + F.bung(x, y) * 0.06;
     }), false);
     var nrm = mkTex(normalCanvas(S2, function (x, y) {
-      return -F.seam(x, y) * 1.0 - F.butt(x, y) * 0.45 + F.grain(x, y) * 0.14;
+      return F.seamH(x, y) - F.butt(x, y) * 0.40 + F.grain(x, y) * 0.14
+           + F.cross(x, y) * 0.10 - F.bung(x, y) * 0.05;
     }, 2.4), false);
     return { map: alb, rough: rgh, normal: nrm };
   }
@@ -393,31 +505,111 @@
     return { map: mkTex(c, true), normal: mkTex(normalCanvas(S2, lay, 1.6), false) };
   }
 
-  /* ---- wheel-rim leather: pebble grain + a spine of hand stitching -------- */
+  /* ---- wheel-rim leather ---------------------------------------------------
+     The wheel is the closest hero prop to camera and its stitching is the
+     detail a viewer uses to date an asset, so this is authored as a REAL
+     wrap, not as a painted spine:
+
+       - the tile is exactly one tube-circumference square (0.176 m), so it is
+         isotropic and lands 20 stitches per tile at an 8.7 mm pitch — 360
+         stitches around a 1.00 m wheel, which is what a wrapped rim carries;
+       - v runs around the tube, and the SEAM CHANNEL sits at v = 0.5, i.e. on
+         the inboard face where a real wrap is closed.  It is a recessed
+         valley with the two leather edges rolling up to it, not a painted
+         line: the thing that reads as stitching at a glance is the shadow in
+         that channel, and a flat decal has none;
+       - the thread is a proper cross-stitch — two crossing diagonals per cell
+         drawn as capsules with round ends — standing PROUD of the leather and
+         crossing the channel, so it catches light on its upper flank and
+         casts into the valley;
+       - pebble grain everywhere at ~1 mm, which is what stops the tube
+         reading as moulded plastic once the stitching is fixed.
+     -------------------------------------------------------------------- */
   function texLeather() {
-    var S2 = 256, PB = new Float32Array(S2 * S2), x, y;
-    for (y = 0; y < S2; y++) for (x = 0; x < S2; x++) PB[y * S2 + x] = fbm(x * 0.11, y * 0.11, 3, 0);
-    function pebble(px, py) { return PB[(((py % S2) + S2) % S2) * S2 + (((px % S2) + S2) % S2)]; }
-    function stitchLine(x, y) {
-      var v = (y / S2 * 8) % 1;
-      var on = Math.abs(v - 0.5) < 0.06 && (Math.floor(x / 7) % 2) === 0;
-      return on ? 1 : 0;
+    var S2 = 256, NST = 26, W = S2 / NST;
+    var PBg = new Float32Array(S2 * S2), x, y;
+    for (y = 0; y < S2; y++) for (x = 0; x < S2; x++) {
+      // two grain scales: the coarse cell structure and the fine tooth
+      PBg[y * S2 + x] = fbm(x * 0.26, y * 0.26, 3, 0) * 0.72 + vn(x * 0.95, y * 0.95, 0) * 0.28;
+    }
+    function pebble(px, py) { return PBg[(((py % S2) + S2) % S2) * S2 + (((px % S2) + S2) % S2)]; }
+    /* Signed distance from a point to a segment, wrapped in x so the pattern
+       tiles: the thread that leaves the right-hand edge arrives on the left. */
+    function segD(px, py, ax, ay, bx, by) {
+      var dx = px - ax, dy = py - ay, ex = bx - ax, ey = by - ay;
+      var t = clamp((dx * ex + dy * ey) / (ex * ex + ey * ey + 1e-9), 0, 1);
+      var qx = dx - ex * t, qy = dy - ey * t;
+      return Math.sqrt(qx * qx + qy * qy);
+    }
+    var HALF = 0.084 * S2;                   // stitch reach either side of the seam
+    /* Where the seam sits around the tube matters more than anything else in
+       this texture.  TorusGeometry puts v = 0 on the outer equator, v = 0.25
+       on the face toward the helmsman and v = 0.5 on the inner equator; the
+       canvas is flipped, so canvas y = 0.60*S2 lands the seam at torus
+       v = 0.40 — on the inner-front quadrant, raking away from the eye the
+       way a real wrap does, visible without sitting flat-on in the middle of
+       the largest smooth surface of the prop. */
+    var CY = S2 * 0.60;
+    /* Thread coverage: 1 on the axis of a strand, falling to 0 at its edge.
+       Radius 0.030 of the tile = 5.3 mm of 2 mm waxed thread rendered with a
+       soft shoulder, which is what a photograph of one actually measures once
+       the highlight either side is counted. */
+    function thread(px, py) {
+      var best = 1e9, k, cx0;
+      for (k = -1; k <= 1; k++) {
+        cx0 = (Math.floor(px / W) + k) * W;
+        best = Math.min(best, segD(px, py, cx0, CY - HALF, cx0 + W, CY + HALF));
+        best = Math.min(best, segD(px, py, cx0, CY + HALF, cx0 + W, CY - HALF));
+      }
+      /* 2.3 mm of waxed thread with a soft shoulder.  Thinner than it wants
+         to be, deliberately: the gaps BETWEEN the strands are where the dark
+         seam channel shows through, and it is that alternating dark/light
+         rhythm — not the strands themselves — that the eye reads as stitching
+         rather than as a moulded bead. */
+      var r = 0.0230 * S2;
+      return best > r ? 0 : Math.cos(best / r * PI * 0.5);
+    }
+    // the closed seam itself: a valley with the leather rolling into it
+    function channel(py) {
+      var dv = Math.abs(py - CY) / S2;
+      return dv < 0.021 ? Math.cos(dv / 0.021 * PI * 0.5) : 0;
+    }
+    function roll(py) {
+      var dv = Math.abs(py - CY) / S2;
+      var t = clamp((dv - 0.022) / 0.050, 0, 1);
+      return t * t * (3 - 2 * t) * (1 - clamp((dv - 0.086) / 0.05, 0, 1));
+    }
+    function height(px, py) {
+      return pebble(px, py) * 0.22 - channel(py) * 1.00 + roll(py) * 0.34 + thread(px, py) * 0.86;
     }
     var c = cvs(S2), g = c.getContext('2d'), im = g.createImageData(S2, S2), d = im.data;
     for (y = 0; y < S2; y++) for (x = 0; x < S2; x++) {
-      var p = pebble(x, y), st = stitchLine(x, y);
-      var l = 0.60 + 0.36 * p, i = (y * S2 + x) * 4;
-      var r = l * 148, gg = l * 112, b = l * 84;
-      if (st) { r = 214; gg = 196; b = 158; }
+      var p = pebble(x, y), th = thread(x, y), ch = channel(y);
+      var l = 0.72 + 0.34 * (p - 0.5), i = (y * S2 + x) * 4;
+      var r = l * 126, gg = l * 88, b = l * 64;
+      // the valley is in permanent shade and holds the dressing that darkens it
+      var cs = clamp(ch * 1.25, 0, 1);
+      r = lerp(r, r * 0.34, cs); gg = lerp(gg, gg * 0.32, cs); b = lerp(b, b * 0.32, cs);
+      if (th > 0.02) {
+        /* Waxed linen, and only about a stop and a half above the leather.
+           The first pass ran it at 182 against a leather at 90, which drew a
+           row of bright teeth and read as a zipper: real stitching separates
+           from the hide by its SHAPE and by the shadow in the channel, not by
+           value, and pushing the value is exactly what makes it look printed. */
+        var tv = 0.88 + 0.24 * hash1(Math.floor(x / W) * 3.1 + Math.floor(y * 0.05));
+        var tk = clamp(th * 1.5, 0, 1);
+        r = lerp(r, 146 * tv, tk); gg = lerp(gg, 122 * tv, tk); b = lerp(b, 92 * tv, tk);
+      }
       d[i] = r; d[i + 1] = gg; d[i + 2] = b; d[i + 3] = 255;
     }
     g.putImageData(im, 0, 0);
     return {
       map: mkTex(c, true),
-      rough: mkTex(grayCanvas(S2, function (x, y) { return 0.62 - 0.14 * pebble(x, y); }), false),
-      normal: mkTex(normalCanvas(S2, function (x, y) {
-        return pebble(x, y) * 0.8 - stitchLine(x, y) * 0.9;
-      }, 2.6), false)
+      rough: mkTex(grayCanvas(S2, function (px, py) {
+        var th = thread(px, py);
+        return clamp(0.66 - 0.17 * pebble(px, py) + 0.16 * channel(py) - 0.06 * th, 0.1, 1);
+      }), false),
+      normal: mkTex(normalCanvas(S2, height, 2.9), false)
     };
   }
 
@@ -453,12 +645,104 @@
     };
   }
 
-  /* ---- gelcoat orange-peel (very subtle, but it kills the CG plastic look) */
+  /* ---- gelcoat orange-peel -------------------------------------------------
+     Two maps, not one.  The normal alone bends the reflection but leaves the
+     surface at ONE roughness value across a whole topside, and a mirror of
+     uniform roughness is exactly what reads as painted foam board: real
+     gelcoat has flake, polish swirls from the buffing wheel and a faint
+     stipple, so the sky arrives as a long soft gradient with structure in it
+     rather than as a clean gradient ramp. */
   function texGel() {
     var S2 = 128;
-    return mkTex(normalCanvas(S2, function (x, y) {
+    function peel(x, y) {
       return fbm(x * 0.18, y * 0.18, 3, 0) * 0.6 + vn(x * 1.1, y * 1.1, 0) * 0.4;
-    }, 0.55), false);
+    }
+    /* Rotary buffing leaves overlapping arcs.  Four passes of concentric
+       rings at different centres, each only a couple of percent of gloss —
+       invisible as a pattern, but it is what stops the highlight terminator
+       from being a mathematically clean curve. */
+    function swirl(x, y) {
+      var s = 0;
+      for (var k = 0; k < 4; k++) {
+        var cx = hash1(k * 3.1 + 0.7) * S2, cy = hash1(k * 7.9 + 2.3) * S2;
+        var dx = x - cx, dy = y - cy, r = Math.sqrt(dx * dx + dy * dy);
+        s += Math.sin(r * (0.55 + 0.25 * hash1(k * 5.5))) * 0.25;
+      }
+      return s * 0.25 + 0.5;
+    }
+    return {
+      normal: mkTex(normalCanvas(S2, function (x, y) {
+        return peel(x, y) * 0.86 + vn(x * 3.7, y * 3.7, 0) * 0.14;
+      }, 0.55), false),
+      /* Mean sits just under 1 so it barely lifts the base roughness; the
+         swing is +-9%, which at 0.18 base is 0.164..0.196 — a difference you
+         only ever see in the length of a specular streak, which is precisely
+         where the eye looks for "is this a photograph". */
+      rough: mkTex(grayCanvas(S2, function (x, y) {
+        return clamp(0.945 + 0.075 * (peel(x, y) - 0.5) + 0.055 * (swirl(x, y) - 0.5)
+                   + 0.030 * (vn(x * 2.9, y * 2.9, 0) - 0.5), 0.55, 1);
+      }), false)
+    };
+  }
+
+  /* ---- brushed / drawn stainless ------------------------------------------
+     Rails, stanchions and pulpit tube are DRAWN tube: the grain runs along
+     the axis, so the sun makes a long streak down the length rather than a
+     round blob.  A CylinderGeometry runs u around the section and v along it,
+     so the streaks must vary in u and hold in v. */
+  function texSteel() {
+    var W = 128, H = 32;
+    /* Built from integer-cycle sinusoids so it tiles EXACTLY in both axes —
+       a rail is 4 m of one texture repeated, and a wrap seam on it is a
+       brighter tell than the missing grain was. */
+    var SF = [], k;
+    for (k = 0; k < 9; k++) {
+      SF.push([Math.round(2 + hash1(k * 2.7 + 1.1) * 44),   // cycles around u
+               hash1(k * 5.3 + 0.4) * TAU,                  // phase
+               1 / (1 + k * 0.85)]);                        // weight
+    }
+    function streak(x, y) {
+      var u = x / W, v = y / H, s = 0, w = 0;
+      for (var q = 0; q < SF.length; q++) {
+        s += Math.sin(u * TAU * SF[q][0] + SF[q][1] + Math.sin(v * TAU + SF[q][1]) * 0.42) * SF[q][2];
+        w += SF[q][2];
+      }
+      return 0.5 + 0.5 * (s / w);
+    }
+    return {
+      rough: mkTex(grayCanvas(W, function (x, y) {
+        return clamp(0.86 + 0.30 * (streak(x, y) - 0.5), 0.40, 1);
+      }, H), false),
+      map: mkTex(grayCanvas(W, function (x, y) {
+        return clamp(0.94 + 0.11 * (streak(x, y) - 0.5), 0, 1);
+      }, H), true),
+      normal: mkTex(normalCanvas(W, streak, 0.9, H), false)
+    };
+  }
+
+  /* ---- powder-coated aluminium --------------------------------------------
+     The bimini frame and the arch are coated, not polished: a fine even
+     orange-peel stipple at ~0.4 mm, semi-matte, with the coating thinning on
+     the outside of every bend.  Getting this wrong (leaving it as chrome) is
+     half of why an arch reads as a bent chrome pipe. */
+  function texPowder() {
+    var S2 = 128;
+    // equal scales with an explicit period so the tile wraps cleanly
+    function stip(x, y) {
+      return vn(x * 2.0, y * 2.0, S2 * 2.0) * 0.55
+           + vn(x * 8.0, y * 8.0, S2 * 8.0) * 0.30
+           + vn(x * 20.0, y * 20.0, S2 * 20.0) * 0.15;
+    }
+    return {
+      rough: mkTex(grayCanvas(S2, function (x, y) {
+        return clamp(0.56 + 0.26 * (stip(x, y) - 0.5)
+                   + 0.10 * (vn(x * 0.25, y * 0.25, S2 * 0.25) - 0.5), 0.2, 1);
+      }), false),
+      map: mkTex(grayCanvas(S2, function (x, y) {
+        return clamp(0.86 + 0.10 * (stip(x, y) - 0.5), 0, 1);
+      }), true),
+      normal: mkTex(normalCanvas(S2, stip, 1.5), false)
+    };
   }
 
   /* ---- chartplotter screen -------------------------------------------------
@@ -578,7 +862,42 @@
        hardtop collapses to the same near-black value, which is precisely the
        "flat primitives in shade" failure. */
     uBounceSide: { value: new T.Vector3(0.0, 0.0, 0.0) },
-    uGrime: { value: 1.0 }
+    uGrime: { value: 1.0 },
+    /* Global scale on the object-space micro-bump, so the whole boat's
+       surface break-up can be calibrated against a measured high-pass
+       contrast without recompiling seventeen materials. */
+    uMicro: { value: 1.0 },
+    /* ---- analytic sun lobe -------------------------------------------------
+       The environment probe is a PMREM: even at 256 its sharpest mip carries
+       the sun as a soft blob a few degrees across, so a roughness-0.15
+       stainless tube reflecting it peaks around 60% grey and NOTHING on the
+       boat ever clips.  A photograph of the same tube in noon sun has a
+       blown-white streak down it that bleeds into the lens.  So the sun gets
+       its own tight punctual lobe on top of the IBL, in VIEW space, gated by
+       the shadow term and by gloss, which is what finally lets stainless,
+       clearcoat and instrument glass hit 1.0 and feed the bloom. */
+    uSunV: { value: new T.Vector3(0.30, 0.90, -0.30) },
+    uSunRad: { value: new T.Vector3(1.0, 0.95, 0.85) },
+    uGlint: { value: 1.0 },
+    /* WORLD-space sun direction.  The lateral bounce term above was isotropic,
+       which is exactly why a two-light rig looks composited: at golden hour the
+       half of the sky the sun is in is two stops brighter and three thousand
+       kelvin warmer than the half behind you, and a cockpit surface facing that
+       way has to know it.  vWN . uSunW gives every fragment its own azimuth
+       against the key, which is the cheap stand-in for an SH-L2 probe set. */
+    uSunW: { value: new T.Vector3(0.30, 0.90, -0.30) },
+    /* The warm side-fill delta that rides on top of the neutral lateral bounce,
+       weighted toward the sun's azimuth.  Near zero at noon, large and amber at
+       17:45 — this is the term that puts orange under the hardtop. */
+    uBounceWarm: { value: new T.Vector3(0.0, 0.0, 0.0) },
+    uRim: { value: 1.0 },
+    /* ---- local cube probes -------------------------------------------------
+       Two probes, both WORLD-axis aligned (see probeUpdate).  Probe 1 (the
+       helm/cockpit volume) is box-projected, so uProbeP / uBoxMin / uBoxMax
+       carry its world position and the world AABB of the cockpit box. */
+    uProbeP: { value: new T.Vector3(0, 5, 0) },
+    uBoxMin: { value: new T.Vector3(-3.2, 3.6, -2.2) },
+    uBoxMax: { value: new T.Vector3(3.2, 6.1, 3.3) }
   };
 
   var GLSL_NOISE = [
@@ -589,13 +908,33 @@
     '                 mix(yhash(i+vec3(0,1,0)),yhash(i+vec3(1,1,0)),f.x),f.y),',
     '             mix(mix(yhash(i+vec3(0,0,1)),yhash(i+vec3(1,0,1)),f.x),',
     '                 mix(yhash(i+vec3(0,1,1)),yhash(i+vec3(1,1,1)),f.x),f.y),f.z); }',
-    'float yfbm(vec3 p){ return ynoise(p)*0.57+ynoise(p*2.17)*0.29+ynoise(p*5.31)*0.14; }'
+    'float yfbm(vec3 p){ return ynoise(p)*0.57+ynoise(p*2.17)*0.29+ynoise(p*5.31)*0.14; }',
+    'float yfbm2(vec3 p){ return ynoise(p)*0.66+ynoise(p*2.31)*0.34; }'
   ].join('\n');
 
   /* patchMat(mat, opts)
        opts.grime  0..1  how much dirt/salt this surface accumulates
        opts.salt   0..1  salt bloom weight (topsides want it, teak does not)
-       opts.rvar   roughness variance amplitude                           */
+       opts.rvar   roughness variance amplitude
+       opts.micro  RMS SURFACE SLOPE of the object-space micro-bump, i.e.
+                   tan(tilt).  0.04 is gelcoat orange peel (~2 deg), 0.20 is
+                   moulded non-skid.  Stated as a slope, not as a shader
+                   constant, because the shader constant depends on the
+                   frequency and getting that coupling wrong once produced a
+                   cast-concrete hull.
+       opts.mscale micro-bump base frequency, cycles/metre
+       opts.up     roughness climb on UP-facing surfaces.  Real gelcoat is not
+                   one number across a moulding: a horizontal face is handled,
+                   walked on, rained on and wiped, and comes up measurably
+                   duller than the vertical topside 200 mm away.
+       opts.haze   wax/salt haze weight — a drying film that streaks the gloss
+                   without changing the colour.
+       opts.envv   per-panel envMapIntensity break, 0..1 of full amplitude.
+                   Adjacent mouldings that share one identical specular
+                   response are read as one moulded plastic object.
+       opts.glint  weight of the analytic sun lobe (0 kills it).
+       opts.grip   1 = this material is the wheel rim; adds hand-wear at
+                   10-and-2 in wheel-local coordinates.                     */
   function patchMat(mat, opts) {
     if (!mat || mat.__yPatched) return mat;
     mat.__yPatched = true;
@@ -603,10 +942,28 @@
     var kG = o.grime === undefined ? 1.0 : o.grime;
     var kS = o.salt === undefined ? 0.55 : o.salt;
     var kR = o.rvar === undefined ? 0.13 : o.rvar;
+    var kSlope = o.micro === undefined ? 0.0 : o.micro;
+    var kF = o.mscale === undefined ? 140.0 : o.mscale;
+    var kUp = o.up === undefined ? 0.0 : o.up;
+    var kHz = o.haze === undefined ? 0.0 : o.haze;
+    var kEV = o.envv === undefined ? 0.10 : o.envv;
+    var kGl = o.glint === undefined ? 1.0 : o.glint;
+    var kGrip = o.grip ? 1 : 0;
+    var kRim = o.rim === undefined ? 0.55 : o.rim;
+    /* probe 1 = the parallax-corrected cockpit probe; anything else takes the
+       open probe above the hardtop and samples it as an infinite environment. */
+    var kBox = o.probe === 1 ? 1 : 0;
+    mat.__yProbe = kBox;
+    /* The three-octave stack below contributes a slope of roughly
+       kF * (1 + 0.17*1.90 + 2.60*0.42) = kF * 2.41 per unit of the shader
+       constant; in quadrature that is about kF * 1.55.  Invert it so the
+       author states the slope and the shader gets the constant. */
+    var kM = kSlope / (1.55 * kF);
     // if a mesh has no aAO attribute the GL default would be 0 (= fully
     // occluded = black).  This makes the default 1 instead: fail bright.
     mat.defaultAttributeValues = mat.defaultAttributeValues || {};
     mat.defaultAttributeValues.aAO = new Float32Array([1]);
+    mat.defaultAttributeValues.aCav = new Float32Array([1]);
     var prevOBC = mat.onBeforeCompile;
     mat.onBeforeCompile = function (sh) {
       if (prevOBC) { try { prevOBC.call(mat, sh); } catch (e) { } }
@@ -614,44 +971,416 @@
       sh.uniforms.uBounceUp = UNI.uBounceUp;
       sh.uniforms.uBounceSide = UNI.uBounceSide;
       sh.uniforms.uGrime = UNI.uGrime;
+      sh.uniforms.uMicro = UNI.uMicro;
+      sh.uniforms.uSunV = UNI.uSunV;
+      sh.uniforms.uSunRad = UNI.uSunRad;
+      sh.uniforms.uGlint = UNI.uGlint;
+      sh.uniforms.uSunW = UNI.uSunW;
+      sh.uniforms.uBounceWarm = UNI.uBounceWarm;
+      sh.uniforms.uRim = UNI.uRim;
+      if (kBox) {
+        sh.uniforms.uProbeP = UNI.uProbeP;
+        sh.uniforms.uBoxMin = UNI.uBoxMin;
+        sh.uniforms.uBoxMax = UNI.uBoxMax;
+      }
 
       sh.vertexShader = sh.vertexShader
         .replace('void main() {',
-          'attribute float aAO;\nvarying float vAO;\nvarying vec3 vMP;\nvarying vec3 vON;\nvoid main() {')
+          'attribute float aAO;\nattribute float aCav;\nvarying float vAO;\nvarying float vCav;\n' +
+          'varying vec3 vMP;\nvarying vec3 vON;\nvarying vec3 vWN;\n' +
+          (kBox ? 'varying vec3 vWPos;\n' : '') + 'void main() {')
         .replace('#include <begin_vertex>',
-          '#include <begin_vertex>\n  vAO = aAO; vMP = transformed; vON = normalize(objectNormal);');
+          '#include <begin_vertex>\n  vAO = aAO; vCav = aCav; vMP = transformed; vON = normalize(objectNormal);\n' +
+          '  vWN = normalize(mat3(modelMatrix) * objectNormal);\n' +
+          (kBox ? '  vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;\n' : ''));
 
       sh.fragmentShader = sh.fragmentShader
+        /* The box-projection helpers are FUNCTIONS, so their varyings and
+           uniforms have to be declared above the pars includes rather than in
+           the usual pre-main block — GLSL has no forward declarations. */
+        .replace(/^/, kBox ? [
+          'varying vec3 vWPos;',
+          'uniform vec3 uProbeP;',
+          'uniform vec3 uBoxMin;',
+          'uniform vec3 uBoxMax;',
+          ''
+        ].join('\n') : '')
+        /* ---- PARALLAX-CORRECTED LOCAL PROBE ------------------------------
+           three samples every environment map as if it were infinitely far
+           away.  That is correct for a sky dome and completely wrong for a
+           probe rendered from inside a 6 x 5 x 2.5 m box: the reflection of
+           the coaming, the hardtop lip and the open side then behaves like a
+           painted-on gradient that slides with the CAMERA instead of with the
+           geometry, which is precisely the "flat grey card with clearcoat
+           written on it" read.  Intersecting the reflection ray with the
+           cockpit's own bounding box and re-referencing it to the probe
+           origin makes the horizon line and the hardtop edge crawl across the
+           gelcoat the way they do in a photograph. */
+        .replace('#include <envmap_physical_pars_fragment>', kBox ? [
+          '#include <envmap_physical_pars_fragment>',
+          '#if defined( USE_ENVMAP ) && defined( ENVMAP_TYPE_CUBE_UV )',
+          'vec3 yBoxDir( const in vec3 dw ) {',
+          '  vec3 nd = normalize(dw);',
+          // never divide by a zero component: an axis-aligned ray would return
+          // an infinity that poisons the min() below
+          '  vec3 na = max(abs(nd), vec3(1e-5));',
+          '  nd = vec3(nd.x < 0.0 ? -na.x : na.x, nd.y < 0.0 ? -na.y : na.y, nd.z < 0.0 ? -na.z : na.z);',
+          '  vec3 rmax = (uBoxMax - vWPos) / nd;',
+          '  vec3 rmin = (uBoxMin - vWPos) / nd;',
+          '  vec3 rb = vec3(nd.x > 0.0 ? rmax.x : rmin.x,',
+          '                 nd.y > 0.0 ? rmax.y : rmin.y,',
+          '                 nd.z > 0.0 ? rmax.z : rmin.z);',
+          '  float fa = min(min(rb.x, rb.y), rb.z);',
+          // a fragment outside the box (a rope tail, a flapping sheet) gets the
+          // plain infinite lookup rather than a wildly mirrored one
+          '  if (!(fa > 0.0) || fa > 60.0) return dw;',
+          '  return (vWPos + nd * fa) - uProbeP;',
+          '}',
+          'vec3 yIBL( const in vec3 viewDir, const in vec3 nrm, const in float rough ) {',
+          '  vec3 rv = reflect(-viewDir, nrm);',
+          '  rv = normalize(mix(rv, nrm, rough * rough));',
+          '  rv = inverseTransformDirection(rv, viewMatrix);',
+          '  return textureCubeUV(envMap, yBoxDir(rv), rough).rgb * envMapIntensity;',
+          '}',
+          '#ifdef USE_ANISOTROPY',
+          'vec3 yIBLA( const in vec3 viewDir, const in vec3 nrm, const in float rough,',
+          '            const in vec3 bt, const in float an ) {',
+          '  vec3 bn = cross(bt, viewDir);',
+          '  bn = normalize(cross(bn, bt));',
+          '  bn = normalize(mix(bn, nrm, pow2(pow2(1.0 - an * (1.0 - rough)))));',
+          '  return yIBL(viewDir, bn, rough);',
+          '}',
+          '#endif',
+          '#endif'
+        ].join('\n') : '#include <envmap_physical_pars_fragment>')
+        .replace('#include <lights_fragment_maps>', kBox ? [
+          '#if defined( RE_IndirectDiffuse )',
+          '  #ifdef USE_LIGHTMAP',
+          '    vec4 lightMapTexel = texture2D( lightMap, vLightMapUv );',
+          '    irradiance += lightMapTexel.rgb * lightMapIntensity;',
+          '  #endif',
+          '  #if defined( USE_ENVMAP ) && defined( STANDARD ) && defined( ENVMAP_TYPE_CUBE_UV )',
+          '    iblIrradiance += getIBLIrradiance( geometryNormal );',
+          '  #endif',
+          '#endif',
+          '#if defined( USE_ENVMAP ) && defined( RE_IndirectSpecular )',
+          '  #if defined( ENVMAP_TYPE_CUBE_UV )',
+          '    #ifdef USE_ANISOTROPY',
+          '      radiance += yIBLA( geometryViewDir, geometryNormal, material.roughness, material.anisotropyB, material.anisotropy );',
+          '    #else',
+          '      radiance += yIBL( geometryViewDir, geometryNormal, material.roughness );',
+          '    #endif',
+          '    #ifdef USE_CLEARCOAT',
+          '      clearcoatRadiance += yIBL( geometryViewDir, geometryClearcoatNormal, material.clearcoatRoughness );',
+          '    #endif',
+          '  #else',
+          '    #ifdef USE_ANISOTROPY',
+          '      radiance += getIBLAnisotropyRadiance( geometryViewDir, geometryNormal, material.roughness, material.anisotropyB, material.anisotropy );',
+          '    #else',
+          '      radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );',
+          '    #endif',
+          '    #ifdef USE_CLEARCOAT',
+          '      clearcoatRadiance += getIBLRadiance( geometryViewDir, geometryClearcoatNormal, material.clearcoatRoughness );',
+          '    #endif',
+          '  #endif',
+          '#endif'
+        ].join('\n') : '#include <lights_fragment_maps>')
         .replace('void main() {',
           'uniform vec3 uBounceDn;\nuniform vec3 uBounceUp;\nuniform vec3 uBounceSide;\n' +
-          'uniform float uGrime;\n' +
-          'varying float vAO;\nvarying vec3 vMP;\nvarying vec3 vON;\n' + GLSL_NOISE +
-          '\nfloat yDirt, yWear;\nvoid main() {')
-        /* --- grime, salt and large-scale value break-up ------------------ */
+          'uniform vec3 uBounceWarm;\nuniform vec3 uSunW;\nuniform float uRim;\n' +
+          'uniform float uGrime;\nuniform float uMicro;\n' +
+          'uniform vec3 uSunV;\nuniform vec3 uSunRad;\nuniform float uGlint;\n' +
+          'varying float vAO;\nvarying float vCav;\nvarying vec3 vMP;\nvarying vec3 vON;\n' +
+          'varying vec3 vWN;\n' + GLSL_NOISE +
+          '\nfloat yDirt, yWear, ySalt, yFine;\nfloat yCav = 1.0, yUp = 0.0, yHaze = 0.0, yPanel = 1.0;\n' +
+          'float ySh = 1.0;\nvec3 yBump = vec3(0.0);\nvoid main() {')
+        /* Capture the sun's own shadow term. three computes it inside the
+           light loop and then throws it away; we need it 30 lines later, in
+           <aomap_fragment>, because the hand-rolled bounce below is added
+           straight into indirectDiffuse and — until this line existed — a
+           fully shadowed cockpit surface still collected 100% of it, which
+           flattened out whatever contrast the (correctly computed) shadow
+           had produced. Same call three makes, one light, r160 signature. */
+        .replace('#include <lights_fragment_begin>', [
+          '#include <lights_fragment_begin>',
+          '#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0',
+          '  {',
+          '    DirectionalLightShadow ySd = directionalLightShadows[ 0 ];',
+          '    ySh = getShadow( directionalShadowMap[ 0 ], ySd.shadowMapSize, ySd.shadowBias,',
+          '                     ySd.shadowRadius, vDirectionalShadowCoord[ 0 ] );',
+          '  }',
+          '#endif'
+        ].join('\n'))
+        /* --- grime, salt and value break-up ------------------------------
+           REWRITTEN.  The previous version put a 3 m-wavelength fbm straight
+           into albedo at +-15.5% and added a raw (1 - AO) term on top; on a
+           white topside that draws big soft charcoal clouds, which is a far
+           louder "this is CG" flag than the flat white it was trying to
+           cure — it reads as soot, not as weather.  Weathering on a boat is
+           DIRECTIONAL and SMALL: rain and spray run DOWN, dirt collects in
+           crevices and on up-facing surfaces, salt dries white and climbs
+           from the waterline.  So: broad tonal drift drops to +-3%, and the
+           energy goes into a vertically-stretched run-down stain, a crevice
+           term gated through a smoothstep, and centimetre-scale flake that
+           lives mostly in the roughness where it belongs. */
         .replace('#include <map_fragment>', [
           '#include <map_fragment>',
           '  {',
           '    float gUp  = clamp(vON.y, 0.0, 1.0);',
-          '    float cav  = 1.0 - clamp(vAO, 0.0, 1.0);',
-          '    float n1   = yfbm(vMP * 1.45);',
-          '    float n2   = yfbm(vMP * 0.33 + 4.0);',
-          '    yWear      = n2;',
-          '    yDirt      = clamp((n1 * 0.62 + n2 * 0.58 - 0.30) * (0.30 + 1.0 * gUp)',
-          '                        + cav * 0.50, 0.0, 1.0) * uGrime * ' + kG.toFixed(3) + ';',
-          '    diffuseColor.rgb *= mix(vec3(1.0), vec3(0.66, 0.645, 0.585), yDirt * 0.40);',
-          '    diffuseColor.rgb *= (0.925 + 0.155 * n2);',
-          '    float salt = clamp((yfbm(vMP * 0.85 + 19.0) - 0.36) * 2.6, 0.0, 1.0)',
-          '               * smoothstep(0.25, 0.85, vMP.y) * (1.0 - gUp * 0.55)',
-          '               * uGrime * ' + kS.toFixed(3) + ';',
+          '    float side = 1.0 - abs(vON.y);',
+          '    yUp = gUp;',
+          /* SHORT-RANGE CAVITY.  vAO is a 2.6 m hemisphere estimate — a
+             room-scale term.  vCav is the same march stopped at 34 cm, so it
+             only fires where two parts actually MEET: the winch foot against
+             the teak, the spoke root in the rim, the stanchion into the
+             coaming, the tube into the bimini beam.  That tight dark band,
+             plus the grime and sealant that collect in it, is what makes
+             hardware read as bolted through rather than resting on top. */
+          '    float crv  = 1.0 - clamp(vCav, 0.0, 1.0);',
+          '    yCav = crv;',
+          '    float cav  = smoothstep(0.16, 0.74, 1.0 - clamp(vAO, 0.0, 1.0));',
+          '    cav = max(cav, crv * 0.85);',
+          '    float nBrd = ynoise(vMP * 0.30 + 4.0);',
+          '    float nMid = yfbm2(vMP * 2.60 + 11.0);',
+          '    float nDec = ynoise(vMP * 7.80 + 23.0);',
+          '    yFine      = ynoise(vMP * 31.0 + 31.0);',
+          '    yWear      = nMid;',
+          /* RUN-DOWN.  The sample point is compressed 15x in Y, so the same
+             noise that draws blobs on a horizontal surface draws vertical
+             runs on a vertical one.  Gated on side-facing normals and grown
+             out of the crevices, because that is where water actually
+             leaves a boat: out of a scupper, off a hatch lip, under a
+             stanchion base. */
+          '    float run  = ynoise(vec3(vMP.x * 5.4, vMP.y * 0.36, vMP.z * 5.4) + 7.0);',
+          '    run = smoothstep(0.47, 0.88, run) * side * (0.20 + 1.00 * cav);',
+          '    float grit = clamp(nMid * 0.80 + nBrd * 0.40 - 0.44, 0.0, 1.0);',
+          '    yDirt = clamp(grit * (0.18 + 0.90 * gUp) + cav * 0.52 + run * 0.62,',
+          '                  0.0, 1.0) * uGrime * ' + kG.toFixed(3) + ';',
+          '    diffuseColor.rgb *= mix(vec3(1.0), vec3(0.705, 0.688, 0.632), yDirt * 0.38);',
+          /* Value break-up across four decades of scale, all of it NEUTRAL —
+             a pure luminance multiplier with no hue shift, which is what
+             stops it reading as dirt.  The broad term is deliberately the
+             smallest of the four: it is the one the old shader over-drove,
+             and a 3 m blotch is always read as a stain, never as a surface.
+             The 13 cm and 3 cm terms are the ones the eye actually uses to
+             decide whether it is looking at a photograph, because they are
+             the scales still resolvable at cockpit and mid-deck distance. */
+          '    diffuseColor.rgb *= (1.0 + 0.030 * (nBrd - 0.5)',
+          '                             + 0.048 * (nMid - 0.5)',
+          '                             + 0.062 * (nDec - 0.5)',
+          '                             + 0.070 * (yFine - 0.5));',
+          /* SALT.  Climbs from the waterline, dries white (not grey), and is
+             gone by the time you reach the coachroof. */
+          '    float saltH = smoothstep(-0.10, 0.75, vMP.y) * (1.0 - smoothstep(2.3, 5.6, vMP.y));',
+          '    ySalt = clamp((yfbm2(vMP * 1.75 + 19.0) - 0.42) * 3.1, 0.0, 1.0)',
+          '          * saltH * (0.30 + 0.70 * side) * uGrime * ' + kS.toFixed(3) + ';',
+          /* A dried salt film is a thin scattering layer, so it LIFTS a dark
+             surface toward its own albedo rather than replacing it.  Keep the
+             lift small: at 0.115 the near-black hull band and the smoked
+             windows came back as pale beige rectangles that read as decals. */
           '    diffuseColor.rgb = mix(diffuseColor.rgb,',
-          '                           diffuseColor.rgb * 0.88 + vec3(0.115, 0.120, 0.118), salt);',
-          '    yDirt = max(yDirt, salt * 0.5);',
+          '                           diffuseColor.rgb * 0.90 + vec3(0.062, 0.064, 0.066), ySalt);',
+          '    yDirt = max(yDirt, ySalt * 0.30);',
+          /* CREVICE LINE.  A hard, narrow darkening exactly where the cavity
+             term fires, carrying a touch of the warm-grey sealant/salt colour
+             that actually lives in a bedded joint.  Kept separate from yDirt
+             so it cannot be washed out by the broad weathering. */
+          '    diffuseColor.rgb *= mix(1.0, 0.52, crv * 0.92);',
+          '    diffuseColor.rgb = mix(diffuseColor.rgb,',
+          '                           diffuseColor.rgb * vec3(1.06, 1.00, 0.92),',
+          '                           smoothstep(0.35, 0.95, crv));',
+          /* PER-PANEL RESPONSE.  One low-frequency object-space field at about
+             1.4 m, quantised softly, so adjacent mouldings do not share an
+             identical specular gain. */
+          '    yPanel = 1.0 + ' + (kEV * 1.35).toFixed(4) + ' * (yfbm2(vMP * 0.72 + 51.0) - 0.5) * 2.0;',
+          /* WAX / SALT HAZE.  A drying film streaks DOWN and pools on the
+             horizontal, and it changes gloss, not colour: a hazed panel keeps
+             its albedo but the reflected horizon goes soft in patches.  This
+             is the last thing missing from a moulding that already has peel
+             and swirl, and it is the one a viewer names as "not polished
+             recently" rather than as "dirty". */
+          kHz > 0 ? [
+            '    float hz = yfbm2(vec3(vMP.x * 2.10, vMP.y * 0.55, vMP.z * 2.10) + 63.0);',
+            '    yHaze = clamp((hz - 0.40) * 2.05, 0.0, 1.0)',
+            '         * (0.30 + 0.70 * gUp) * ' + kHz.toFixed(3) + ';'
+          ].join('\n') : '',
+          kGrip ? [
+            /* Hand wear on the wheel rim: the leather at 10-and-2 is
+               compressed, darkened and polished by ten thousand hours of
+               palms, and the grain there is half gone. */
+            '    float ga = atan(vMP.y, vMP.x);',
+            '    float g1 = exp(-pow((ga - 0.524) / 0.40, 2.0));',
+            '    float g2 = exp(-pow((ga - 2.618) / 0.40, 2.0));',
+            '    float g3 = exp(-pow((ga + 1.571) / 0.55, 2.0)) * 0.45;',
+            '    yWear = clamp(g1 + g2 + g3, 0.0, 1.0);',
+            '    diffuseColor.rgb *= mix(1.0, 0.74, yWear * 0.85);',
+            '    diffuseColor.rgb = mix(diffuseColor.rgb,',
+            '                           diffuseColor.rgb * vec3(1.10, 1.02, 0.94), yWear * 0.6);',
+            /* DE-TILING.  The wrap texture goes round the rim exactly 18 times,
+               and 18 identical stitch panels marching round a 1 m circle is the
+               single most legible repeat anywhere on the boat.  Three
+               incommensurate harmonics of the rim angle break the value, the
+               hue and the gloss between one wrap section and the next, so no
+               two adjacent panels read as the same leather even though they
+               share a texel for texel identical map. */
+            '    float gw = 0.052 * sin(ga * 5.0 + 0.7)',
+            '             + 0.038 * sin(ga * 11.0 + 2.3)',
+            '             + 0.030 * sin(ga * 23.0 + 5.1);',
+            '    diffuseColor.rgb *= (1.0 + gw);',
+            '    diffuseColor.rgb = mix(diffuseColor.rgb,',
+            '                           diffuseColor.rgb * vec3(1.05, 0.99, 0.93),',
+            '                           clamp(0.5 + 2.4 * gw, 0.0, 1.0) * 0.35);',
+            /* The tail of the wrap where it turns away from the light: leather
+               that has never been gripped keeps its nap and goes matte, and the
+               falloff has to be a smooth function of the rim angle rather than
+               a texture event, or the whole rim shares one gloss. */
+            '    yHaze = max(yHaze, clamp(0.42 - gw * 3.0, 0.0, 1.0) * 0.55);'
+          ].join('\n') : '',
           '  }'
         ].join('\n'))
+        /* Micro-contrast lives HERE, not in albedo.  A gloss surface whose
+           roughness is one constant returns a specular whose terminator is a
+           mathematically clean curve, and that single fact is most of what
+           separates a render from a photograph.  Three scales: the material's
+           own wear band, the dirt/salt matting, and a centimetre flake. */
         .replace('#include <roughnessmap_fragment>', [
           '#include <roughnessmap_fragment>',
-          '  roughnessFactor = clamp(roughnessFactor + (yWear - 0.5) * ' + kR.toFixed(3),
-          '                          + yDirt * 0.26, 0.015, 1.0);'
+          '  roughnessFactor = clamp(roughnessFactor',
+          '                        + (yWear - 0.5) * ' + kR.toFixed(3),
+          '                        + yDirt * 0.30 + ySalt * 0.34',
+          /* Up-facing climb.  A horizontal moulding is handled and walked on;
+             a crevice holds compound and dust.  Both are ROUGHNESS events,
+             not colour events, and stating them here is what breaks the one
+             constant-roughness plane that the whole hull family shared. */
+          '                        + yUp * yUp * ' + kUp.toFixed(3),
+          '                        + yCav * ' + (0.22 + kUp * 0.6).toFixed(3),
+          '                        + yHaze * 0.30',
+          '                        + (yFine - 0.5) * 0.115, 0.015, 1.0);',
+          kGrip ? '  roughnessFactor = clamp(roughnessFactor - yWear * 0.34, 0.06, 1.0);' : ''
+        ].join('\n'))
+        /* OBJECT-SPACE MICRO-BUMP.  Measured on the shipped build, a flat
+           gelcoat coaming face returns 0.91% local (9 px high-pass) contrast;
+           a photograph of the same panel returns 2.5-4%.  That gap IS the
+           "untextured white plastic" verdict, and it cannot be closed with a
+           texture: the gel meshes are BoxGeometry, whose UVs run 0..1 per
+           face regardless of the face being 4.4 m or 40 mm, so one tiling
+           rate lands orange peel at 16 cm on a coaming and 1.4 mm on a
+           locker lid. Object space has no such problem — the frequency is in
+           cycles per METRE and is therefore correct on every panel of the
+           boat. Perturbation is built by forward differences of the noise
+           against the screen-space derivatives of the view position (three's
+           own perturbNormalArb algebra), so the amplitude is independent of
+           distance and the bump self-anti-aliases: once a cycle is smaller
+           than a pixel, dFdx of the noise stops growing and the perturbation
+           fades instead of boiling. */
+        .replace('#include <normal_fragment_maps>', [
+          '#include <normal_fragment_maps>',
+          kM > 0 ? [
+            '  {',
+            /* 1/f stack: the fine octave is the flake, the coarse one the
+               panel unevenness that survives to 20 m.  Amplitudes rise as
+               the frequency falls so each octave contributes a comparable
+               SLOPE rather than a comparable height. */
+            '    float yh = ynoise(vMP * ' + kF.toFixed(2) + ')',
+            '             + 1.90 * ynoise(vMP * ' + (kF * 0.17).toFixed(3) + ' + 9.0)',
+            '             + 0.42 * ynoise(vMP * ' + (kF * 2.60).toFixed(2) + ' + 3.0);',
+            '    vec2 yd = vec2(dFdx(yh), dFdy(yh)) * (' + kM.toPrecision(5) + ' * uMicro);',
+            '    vec3 sx = dFdx(-vViewPosition), sy = dFdy(-vViewPosition);',
+            '    vec3 r1 = cross(sy, normal), r2 = cross(normal, sx);',
+            '    float dt = dot(sx, r1);',
+            '    if (abs(dt) > 1e-12) {',
+            '      yBump = sign(dt) * (yd.x * r1 + yd.y * r2);',
+            '      normal = normalize(abs(dt) * normal - yBump);',
+            '      yBump /= max(abs(dt), 1e-12);',
+            '    }',
+            '  }'
+          ].join('\n') : ''
+        ].join('\n'))
+        /* The peel lives in the CLEARCOAT as much as in the base coat — that
+           is what makes a gelcoat highlight ripple instead of being a clean
+           ellipse — so the same perturbation goes on the coat normal. */
+        .replace('#include <clearcoat_normal_fragment_maps>', [
+          '#include <clearcoat_normal_fragment_maps>',
+          '#ifdef USE_CLEARCOAT',
+          '  clearcoatNormal = normalize(clearcoatNormal - yBump * 0.80);',
+          '#endif'
+        ].join('\n'))
+        /* Clearcoat is a SECOND lobe and it was being left perfectly uniform,
+           so gelcoat mirrored the sky through a flawless varnish while the
+           base coat underneath carried all the wear. Break it by the same
+           flake, and let dirt kill the coat locally. */
+        .replace('#include <lights_physical_fragment>', [
+          '#include <lights_physical_fragment>',
+          '#ifdef USE_CLEARCOAT',
+          '  material.clearcoatRoughness = clamp(material.clearcoatRoughness',
+          '        + (yFine - 0.5) * 0.075 + yDirt * 0.22',
+          '        + yHaze * 0.26 + yUp * yUp * ' + (kUp * 0.55).toFixed(4),
+          '        + yCav * 0.18, 0.006, 1.0);',
+          '  material.clearcoat = clamp(material.clearcoat * (1.0 - yDirt * 0.35)',
+          '        * (1.0 - yHaze * 0.30) * (1.0 - yCav * 0.45), 0.0, 1.0);',
+          '#endif'
+        ].join('\n'))
+        /* --- ANALYTIC SUN LOBE -------------------------------------------
+           The IBL cannot produce a clipping highlight: a PMREM's sharpest mip
+           spreads the solar disk over several degrees, so the brightest thing
+           a polished tube ever returned was a soft grey oval.  This is a
+           punctual GGX lobe for the sun alone, in view space, weighted by
+           gloss so matte surfaces get nothing and by the sun's own shadow so
+           a tube in shade stays in shade.  It is what puts a hard white dot
+           on the wheel knobs, a blown streak down the stainless and a
+           specular clip on the clearcoat that the bloom can pick up. */
+        .replace('#include <lights_fragment_end>', [
+          '#include <lights_fragment_end>',
+          kGl > 0 ? [
+            '  {',
+            '    vec3 yL = normalize(uSunV);',
+            '    float yNL = dot(normal, yL);',
+            '    if (yNL > 0.0) {',
+            '      vec3 yV = normalize(vViewPosition);',
+            '      vec3 yH = normalize(yL + yV);',
+            '      float yNH = max(dot(normal, yH), 0.0);',
+            /* Floor alpha at the solar disk's own angular radius (0.0047 rad)
+               so the lobe cannot become a delta function on a mirror and
+               produce a one-pixel firefly. */
+            '      float ya = max(material.roughness * material.roughness, 0.0060);',
+            '      float yd = yNH * yNH * (ya * ya - 1.0) + 1.0;',
+            '      float yD = (ya * ya) / (3.141592654 * yd * yd);',
+            '      float yVo = max(dot(normal, yV), 1e-3);',
+            '      float yG = 0.5 / max(yNL + yVo, 1e-3);',
+            '      float yF = exp2((-5.55473 * max(dot(yV, yH), 0.0) - 6.98316) * max(dot(yV, yH), 0.0));',
+            '      vec3 yFc = material.specularColor + (vec3(1.0) - material.specularColor) * yF;',
+            '      float ySharp = smoothstep(0.62, 0.10, material.roughness);',
+            '      vec3 yAdd = uSunRad * (yD * yG * yNL * ySh * ySharp',
+            '                * uGlint * ' + kGl.toFixed(3) + ') * yFc;',
+            /* Hard ceiling.  An unclamped punctual GGX against a near-mirror
+               is a delta function: it produces a single blown texel that the
+               bloom then smears into a lens-flare disc across half the frame.
+               The ceiling is set so the brightest surfaces clip to white and
+               bleed a little, which is the photograph, and no further. */
+            '      reflectedLight.directSpecular += min(yAdd, uSunRad * 150.0);',
+            '    }',
+            '  }'
+          ].join('\n') : '',
+          /* ---- SUN RIM ------------------------------------------------------
+             A backlit black boom, a stainless post against a low sun and the
+             leech of a sail all carry a bright edge where the surface turns
+             through grazing incidence into the key.  A two-light rig cannot
+             produce it — the GGX lobe above needs N.H near 1 and dies at the
+             silhouette, and the IBL is far too broad — so the limb of every
+             spar in the golden frame terminated in the same value as its
+             middle.  This is a Fresnel-weighted grazing term gated by the
+             sun's own shadow, which is what separates a backlit object from
+             the water behind it. */
+          kRim > 0 ? [
+            '  {',
+            '    vec3 yVn = normalize(vViewPosition);',
+            '    float yFr = 1.0 - clamp(dot(normal, yVn), 0.0, 1.0);',
+            '    yFr = yFr * yFr * yFr * (0.30 + 0.70 * yFr);',
+            '    float ySl = smoothstep(-0.30, 0.72, dot(normal, normalize(uSunV)));',
+            '    reflectedLight.directSpecular += uSunRad * (yFr * ySl * ySh * uRim',
+            '                                  * ' + (kRim * 3.4).toFixed(3) + ');',
+            '  }'
+          ].join('\n') : ''
         ].join('\n'))
         /* --- baked AO on indirect only, then the bounce ------------------- */
         .replace('#include <aomap_fragment>', [
@@ -664,8 +1393,25 @@
              blend the broad component back toward 1 so the cockpit does not
              go to ink. */
           '    float contact = bAO * bAO * (3.0 - 2.0 * bAO);',
-          '    reflectedLight.indirectDiffuse  *= mix(0.42, 1.0, contact);',
-          '    reflectedLight.indirectSpecular *= mix(0.52, 1.0, contact);',
+          /* 0.52, not 0.42.  The cockpit was measuring 6.6% of its pixels at
+             near-black with no detail in them, and an open cockpit at golden
+             hour is lit by a sky dome plus a fully lit orange sea — it is a
+             bright environment, not a cave.  The contrast that used to come
+             from crushing the broad term now comes from the SHORT-RANGE
+             cavity below, which is where it belongs. */
+          '    reflectedLight.indirectDiffuse  *= mix(0.63, 1.0, contact);',
+          '    reflectedLight.indirectSpecular *= mix(0.68, 1.0, contact);',
+          /* Crevice-scale occlusion, applied hard.  This is the term that has
+             to be tight — it must hug the winch foot and the spoke root and
+             stop dead at the geometric boundary, which a screen-space AO at a
+             1.5 m radius cannot do and a soft blob decal actively fights. */
+          '    float ctK = 1.0 - yCav * 0.80;',
+          '    reflectedLight.indirectDiffuse  *= ctK;',
+          '    reflectedLight.indirectSpecular *= 1.0 - yCav * 0.66;',
+          '    reflectedLight.directSpecular   *= 1.0 - yCav * 0.35;',
+          /* Per-panel specular gain: two mouldings that meet at a joint no
+             longer return the identical environment response. */
+          '    reflectedLight.indirectSpecular *= yPanel;',
           '    float dn = clamp(-vON.y, 0.0, 1.0);',
           '    float up = clamp( vON.y, 0.0, 1.0);',
           '    float sd = 1.0 - abs(vON.y);',
@@ -674,14 +1420,61 @@
              the gradient that keeps a hardtop underside from reading as one
              dead value across two metres. */
           '    float outb = 0.62 + 0.68 * smoothstep(0.0, 3.05, abs(vMP.x));',
-          '    vec3 bounce = uBounceDn * (dn * outb) + uBounceUp * up',
-          '                + uBounceSide * sd;',
+          /* KEY / FILL SEPARATION.  Everything above is azimuthally flat, so a
+             bulkhead facing into a burning western sky and the one facing the
+             cold eastern half received identical fill — the single reason the
+             boat reads as composited onto the sky rather than standing in it.
+             uSunW is the world sun direction; projecting both it and the world
+             normal onto the horizontal plane gives each fragment its own angle
+             against the key, and uBounceWarm carries the amber that only the
+             sunward half of the horizon actually has. */
+          '    vec2 ySw = uSunW.xz;',
+          '    vec2 yNw = vWN.xz;',
+          '    float ySwL = length(ySw), yNwL = length(yNw);',
+          '    float yAz = (ySwL > 1e-4 && yNwL > 1e-4) ? dot(ySw / ySwL, yNw / yNwL) : 0.0;',
+          '    vec3 ySide = uBounceSide * (1.0 + 0.44 * yAz)',
+          '               + uBounceWarm * clamp(yAz, 0.0, 1.0);',
+          /* The underside of a hardtop is uplit by the sea, and the sea on the
+             sun's side of the boat is a glitter path an order of magnitude
+             brighter than the sea behind it.  Feed a little of the same
+             azimuth in, so the bimini has a gradient across its width instead
+             of one dead value. */
+          '    vec3 yDn = uBounceDn + uBounceWarm * (0.42 * clamp(yAz, 0.0, 1.0));',
+          '    vec3 bounce = yDn * (dn * outb) + uBounceUp * up',
+          '                + ySide * sd;',
+          /* Whatever is between this fragment and the sun is also between it
+             and most of the sunlit deck and water that produced the bounce.
+             Not zero — the sea beyond the shadow still throws light in — but
+             not the full term either. */
+          /* 0.60, not 0.42.  What is between this fragment and the sun is a
+             hardtop or a coaming — it is NOT between the fragment and the
+             three metres of open side through which a fully lit orange sea
+             fills the cockpit.  Attenuating the whole bounce by the sun's own
+             shadow term treated the uplight as if it came from the sun
+             directly, and that single factor is most of what crushed the
+             shaded cockpit to black. */
+          '    bounce *= mix(0.60, 1.0, ySh);',
           '    reflectedLight.indirectDiffuse += material.diffuseColor * bounce',
-          '                                    * RECIPROCAL_PI * mix(0.66, 1.0, contact);',
+          '                                    * RECIPROCAL_PI * mix(0.70, 1.0, contact) * ctK;',
+          /* A METAL HAS NO DIFFUSE PATH.  Every bit of the sea/deck uplight
+             above was landing on indirectDiffuse, which for metalness 1 is
+             identically zero — so a polished tube under the hardtop was lit
+             by the probe alone, and the probe sees mostly dark deck when it
+             looks down.  That is precisely why the bimini post's specular
+             contrast collapsed in its lower half and terminated in a black
+             stub at the sole.  The same irradiance, routed onto the specular
+             lobe through the material's own F0, carries the falloff all the
+             way to the deck. */
+          '    reflectedLight.indirectSpecular += material.specularColor * bounce',
+          '                                    * RECIPROCAL_PI * mix(0.62, 1.0, contact) * ctK * 0.90;',
           '  }'
         ].join('\n'));
     };
-    mat.customProgramCacheKey = function () { return 'ypatch' + kG + '_' + kS + '_' + kR; };
+    mat.customProgramCacheKey = function () {
+      return 'ypatch' + kG + '_' + kS + '_' + kR + '_' + kM + '_' + kF +
+             '_' + kUp + '_' + kHz + '_' + kEV + '_' + kGl + '_' + kGrip +
+             '_' + kRim + '_' + kBox;
+    };
     return mat;
   }
 
@@ -698,7 +1491,8 @@
       cushion: texCushion(), winch: texWinch(),
       net: texNet(), rope: texRope(226, 226, 222), sheet: texRope(58, 74, 96),
       leather: texLeather(), mast: texMast(), gel: texGel(),
-      screen: texScreen(), dial: texDial(), flag: texFlag()
+      screen: texScreen(), dial: texDial(), flag: texFlag(),
+      steel: texSteel(), powder: texPowder()
     };
     return TX;
   }
@@ -741,7 +1535,12 @@
        flake in the gelcoat, so the sky reflection stays mirror-smooth and the
        surface reads as painted foam board.  Twenty-eight puts it at the right
        physical scale on every panel from a locker lid to the coachroof. */
-    var gelN = X.gel.clone(); gelN.repeat.set(28, 28); gelN.needsUpdate = true;
+    var gelN = X.gel.normal.clone(); gelN.repeat.set(28, 28); gelN.needsUpdate = true;
+    /* The roughness tile is deliberately NOT the same rate as the normal.
+       Orange peel is a 1-3 mm phenomenon; buffing swirls and flake density
+       vary over a hand's width.  Running both at 28 would beat against each
+       other and produce a visible moire on any large panel. */
+    var gelR = X.gel.rough.clone(); gelR.repeat.set(6.5, 6.5); gelR.needsUpdate = true;
     var nsc = 0.22;
 
     M = {};
@@ -749,38 +1548,75 @@
        carry a blown specular streak and every horizontal face must pick up
        the sun's colour.  envMapIntensity is deliberately above 1 — the probe
        is the only thing carrying the horizon line and the bright water. */
+    /* The gelcoat family is the largest thing in frame and was the single
+       loudest "untextured clay" tell, so it carries the full surfacing set:
+       orange peel at 2-4 mm (gelN at 28 tiles), buffing swirl and flake in the
+       roughness (gelR at 6.5), an object-space micro-bump in cycles per METRE
+       so the peel is the right physical size on a locker lid and on the
+       coachroof alike, a roughness that CLIMBS on up-facing surfaces and into
+       every crevice, a wax/salt haze that streaks the gloss without touching
+       the colour, and a per-panel envMapIntensity break so two mouldings that
+       meet at a joint never return the identical reflection. */
     M.gel = pbr({
-      color: 0xeef1ee, roughness: 0.18, metalness: 0.0,
-      clearcoat: 1.0, clearcoatRoughness: 0.045, envMapIntensity: 1.45,
-      normalMap: gelN, normalScale: new T.Vector2(nsc, nsc), envMap: env
-    }, { grime: 0.85, salt: 0.75, rvar: 0.10 });
+      color: 0xeef1ee, roughness: 0.155, metalness: 0.0,
+      clearcoat: 1.0, clearcoatRoughness: 0.040, envMapIntensity: 1.45,
+      normalMap: gelN, normalScale: new T.Vector2(nsc, nsc),
+      roughnessMap: gelR, envMap: env
+    }, { grime: 0.85, salt: 0.75, rvar: 0.10, micro: 0.042, mscale: 150.0,
+         up: 0.135, haze: 0.85, envv: 0.14 });
     M.gelGrey = pbr({
-      color: 0xc3cad0, roughness: 0.24, metalness: 0.0,
-      clearcoat: 0.95, clearcoatRoughness: 0.075, envMapIntensity: 1.35,
-      normalMap: gelN, normalScale: new T.Vector2(nsc, nsc), envMap: env
-    }, { grime: 1.0, salt: 0.55, rvar: 0.12 });
+      color: 0xc3cad0, roughness: 0.22, metalness: 0.0,
+      clearcoat: 0.95, clearcoatRoughness: 0.070, envMapIntensity: 1.35,
+      normalMap: gelN, normalScale: new T.Vector2(nsc, nsc),
+      roughnessMap: gelR, envMap: env
+    }, { grime: 1.0, salt: 0.55, rvar: 0.12, micro: 0.050, mscale: 150.0,
+         up: 0.150, haze: 0.95, envv: 0.15 });
     /* Helm dash panel.  Every production cat moulds this in a dark low-gloss
        grey so the sun does not bounce off it into the helmsman's eyes, and
        that dark field is what makes the instruments and the white console
        around it separate instead of collapsing into one white mass. */
     M.dash = pbr({
       color: 0x2f3438, roughness: 0.52, metalness: 0.0,
-      clearcoat: 0.35, clearcoatRoughness: 0.30, envMapIntensity: 1.1,
+      clearcoat: 0.35, clearcoatRoughness: 0.30, envMapIntensity: 1.5,
       normalMap: gelN, normalScale: new T.Vector2(nsc * 1.4, nsc * 1.4), envMap: env
-    }, { grime: 0.9, salt: 0.6, rvar: 0.14 });
+    }, { grime: 0.9, salt: 0.6, rvar: 0.14, micro: 0.085, mscale: 95.0, probe: 1 });
+    /* INTERIOR GELCOAT.  Materially identical to M.gel, but bound to the
+       box-projected cockpit probe instead of the open one.  The flybridge
+       coamings, the helm console and the hardtop valance are the surfaces the
+       review called "a Lambertian grey card with clearcoat written on it":
+       they are two metres from the eye and they need reflections with
+       PARALLAX — the hardtop lip, the wheel and the horizon through the open
+       side sliding across them as the boat heels.  An infinitely-distant sky
+       probe cannot produce that at any resolution, which is why the previous
+       pass bought nothing by raising clearcoat to 1.0.  Costs one draw call. */
+    /* envMapIntensity 1.85, against 1.45 for the same gelcoat on the open
+       probe.  A cube rendered from inside a room is a ONE-BOUNCE estimate of a
+       space whose walls light each other, so it under-reports by roughly the
+       square of the surface albedo; the multiplier is the standard correction
+       for it and is why interior probes are always authored hot. */
+    M.gelIn = pbr({
+      color: 0xeef1ee, roughness: 0.150, metalness: 0.0,
+      clearcoat: 1.0, clearcoatRoughness: 0.038, envMapIntensity: 1.85,
+      normalMap: gelN, normalScale: new T.Vector2(nsc, nsc),
+      roughnessMap: gelR, envMap: env
+    }, { grime: 0.85, salt: 0.70, rvar: 0.10, micro: 0.042, mscale: 150.0,
+         up: 0.135, haze: 0.80, envv: 0.14, probe: 1 });
     M.hullBand = pbr({
       color: 0x1c2b36, roughness: 0.14, metalness: 0.0,
-      clearcoat: 1.0, clearcoatRoughness: 0.035, envMapIntensity: 1.5, envMap: env
-    }, { grime: 0.7, salt: 1.0, rvar: 0.08 });
+      clearcoat: 1.0, clearcoatRoughness: 0.035, envMapIntensity: 1.5, envMap: env,
+      normalMap: gelN, normalScale: new T.Vector2(nsc * 0.8, nsc * 0.8),
+      roughnessMap: gelR
+    }, { grime: 0.7, salt: 0.55, rvar: 0.08, micro: 0.038, mscale: 150.0,
+         up: 0.10, haze: 0.70, envv: 0.12 });
     M.boot = pbr({ color: 0x0b2438, roughness: 0.30, metalness: 0.0, clearcoat: 0.8, envMap: env },
-                 { grime: 1.2, salt: 0.9 });
+                 { grime: 1.2, salt: 0.9, micro: 0.055, mscale: 120.0 });
     // hull windows are smoked and opaque — there is a cabin behind them, not sky
     M.hullWin = pbr({
       color: 0x070c11, roughness: 0.035, metalness: 0.0, envMap: env,
       envMapIntensity: 2.1, clearcoat: 1.0, clearcoatRoughness: 0.02
-    }, { grime: 0.35, salt: 0.8, rvar: 0.05 });
+    }, { grime: 0.35, salt: 0.8, rvar: 0.05, micro: 0.018, mscale: 210.0 });
     M.antifoul = pbr({ color: 0x14242c, roughness: 0.72, metalness: 0.0, envMap: env },
-                     { grime: 0.5, salt: 0.0 });
+                     { grime: 0.5, salt: 0.0, micro: 0.190, mscale: 42.0 });
     M.glass = pbr({
       color: 0x0c1a22, roughness: 0.045, metalness: 0.0, envMap: env,
       envMapIntensity: 1.8, transparent: true, opacity: 0.55,
@@ -796,18 +1632,72 @@
       envMapIntensity: 2.4, transparent: true, opacity: 0.16,
       clearcoat: 1.0, clearcoatRoughness: 0.015, side: T.DoubleSide,
       depthWrite: false
-    }, { grime: 0.15, salt: 0.45, rvar: 0.02 });
+    }, { grime: 0.15, salt: 0.45, rvar: 0.02, probe: 1 });
+    /* Drawn stainless tube: rails, stanchions, pulpit, grab rails.  Polished
+       316 is NOT a uniform mirror — it carries the draw lines from the die,
+       so the sun lands as a long streak down the length instead of a round
+       blob, and every one of those tubes reads as a tube rather than as a
+       chrome primitive. */
+    /* 1 x 7, not 1 x 3.  A draw line is a scratch a few tens of microns wide:
+       at three repeats up a 2.3 m post the "grain" lands at 30 cm, which is
+       not grain, it is FLUTING — and a fluted column is what the bimini
+       support was reading as.  Seven repeats plus a lighter normal puts the
+       streaks back below the scale at which the eye resolves them
+       individually and leaves only the long specular they are there for. */
+    var stlN = X.steel.normal.clone(); stlN.repeat.set(1, 7.0); stlN.needsUpdate = true;
+    var stlR = X.steel.rough.clone(); stlR.repeat.set(1, 7.0); stlR.needsUpdate = true;
+    var stlM = X.steel.map.clone(); stlM.repeat.set(1, 7.0); stlM.needsUpdate = true;
     M.steel = pbr({
-      color: 0xcfd6da, roughness: 0.17, metalness: 1.0, envMap: env, envMapIntensity: 1.2
-    }, { grime: 0.55, salt: 0.4, rvar: 0.10 });
+      color: 0xd9dcdc, roughness: 0.185, metalness: 1.0, envMap: env, envMapIntensity: 1.22,
+      map: stlM, roughnessMap: stlR, normalMap: stlN,
+      normalScale: new T.Vector2(0.16, 0.16)
+    }, { grime: 0.55, salt: 0.4, rvar: 0.10, micro: 0.045, mscale: 320.0 });
     M.steelSat = pbr({
-      color: 0xb9c1c6, roughness: 0.38, metalness: 1.0, envMap: env, envMapIntensity: 1.15
-    }, { grime: 0.8, salt: 0.4, rvar: 0.14 });
+      color: 0xc3c9cc, roughness: 0.38, metalness: 1.0, envMap: env, envMapIntensity: 1.15,
+      map: stlM, roughnessMap: stlR, normalMap: stlN,
+      normalScale: new T.Vector2(0.24, 0.24)
+    }, { grime: 0.8, salt: 0.4, rvar: 0.14, micro: 0.085, mscale: 260.0 });
+    /* POLISHED SOLID stainless — spoke knobs, ball ends, anything turned from
+       bar rather than drawn from tube.  Deliberately MAPLESS.  Wrapping a
+       drawn-tube streak texture round a sphere is what turned the wheel knobs
+       into mottled lava marbles: the u-varying streak plus a strong normal map
+       on a spherical UV produces high-frequency noise with no coherent
+       reflection anywhere on it.  A turned knob is a little mirror: it should
+       show a compressed image of the horizon and a hard sun dot, and nothing
+       else.  All the break-up it gets is a fingerprint-scale roughness
+       modulation from the object-space micro term. */
+    /* Bound to the COCKPIT probe: a polished spoke ball is a fisheye mirror of
+       the helm, and what sells it is the hard bright/dark split at the horizon
+       plus the dark shapes of the coaming and the wheel wrapped round it.  An
+       infinite sky probe gives a smooth grey gradient and nothing else, which
+       is exactly what the review named as the classic ambient-probe metal.
+       Roughness comes down to 0.16 as well — the probe is now sharp enough to
+       carry an edge, and 0.25 was blurring the horizon line away. */
+    M.chrome = pbr({
+      color: 0xe3e7e9, roughness: 0.160, metalness: 1.0, envMap: env,
+      envMapIntensity: 1.20
+    }, { grime: 0.35, salt: 0.20, rvar: 0.045, micro: 0.020, mscale: 620.0,
+         envv: 0.06, probe: 1 });
+    /* Powder-coated aluminium: bimini frame, arch, hardtop supports.  A
+       coating, not a polish — semi-matte with a fine even stipple, so it
+       separates from the stainless standing next to it instead of every
+       tube on the boat sharing one chrome look. */
+    M.powder = pbr({
+      color: 0xdfe3e2, roughness: 1.0, metalness: 0.08, envMap: env, envMapIntensity: 1.0,
+      map: X.powder.map, roughnessMap: X.powder.rough, normalMap: X.powder.normal,
+      normalScale: new T.Vector2(0.55, 0.55), clearcoat: 0.22, clearcoatRoughness: 0.55
+    }, { grime: 1.0, salt: 0.55, rvar: 0.10, micro: 0.130, mscale: 300.0 });
     /* Brushed stainless is defined by what surrounds it: the drum reflects
        deck, coaming and water through the local probe, and the brushing runs
        circumferentially, so the highlight is a band and not a blob. */
+    /* NEUTRAL, not cool.  A metal has no diffuse: everything you see on it is
+       the environment multiplied by its own tint, so a 0xc6ced3 drum sitting
+       on teak that the golden sun has just turned amber came back grey and
+       read as a part cut out of a different photograph.  316 stainless is very
+       close to neutral in reflectance; give it that, and it picks up the key
+       light's colour the way the teak beside it does. */
     M.winch = pbr({
-      color: 0xc6ced3, roughness: 0.26, metalness: 1.0, envMap: env, envMapIntensity: 1.2,
+      color: 0xd8dad8, roughness: 0.24, metalness: 1.0, envMap: env, envMapIntensity: 1.25,
       map: X.winch.map, roughnessMap: X.winch.rough, normalMap: X.winch.normal,
       normalScale: new T.Vector2(0.9, 0.9),
       anisotropy: 0.65, anisotropyRotation: 0.0
@@ -829,7 +1719,7 @@
       map: X.nonskid.map, roughnessMap: X.nonskid.rough, normalMap: X.nonskid.normal,
       normalScale: new T.Vector2(1.0, 1.0), color: 0xe9ece7,
       roughness: 1.0, metalness: 0.0, envMap: env
-    }, { grime: 1.35, salt: 0.5, rvar: 0.15 });
+    }, { grime: 1.35, salt: 0.5, rvar: 0.15, micro: 0.170, mscale: 110.0 });
     M.canvasNavy = pbr({
       map: X.navy.map, roughnessMap: X.navy.rough, normalMap: X.navy.normal,
       normalScale: new T.Vector2(0.9, 0.9), roughness: 1.0, metalness: 0.0,
@@ -846,13 +1736,19 @@
       map: X.liner.map, roughnessMap: X.liner.rough, normalMap: X.liner.normal,
       normalScale: new T.Vector2(0.85, 0.85), roughness: 1.0, metalness: 0.0,
       sheen: 0.5, sheenRoughness: 0.75, sheenColor: new T.Color(0x9fb4b8),
-      side: T.DoubleSide, envMap: env, envMapIntensity: 1.2
-    }, { grime: 0.85, salt: 0.35, rvar: 0.10 });
+      side: T.DoubleSide, envMap: env, envMapIntensity: 1.75
+    }, { grime: 0.85, salt: 0.35, rvar: 0.10, probe: 1 });
+    /* Both of these live entirely INSIDE the covered volume and both face
+       down or inward, so their irradiance has to come from the cockpit probe:
+       given the open probe they sample its nadir, which is the top of the
+       hardtop — grey gelcoat and a black solar array — and the headliner goes
+       to ink under a Caribbean noon.  The cockpit probe's nadir is the lit
+       teak sole two metres below them, which is the actual source. */
     M.cushion = pbr({
       map: X.cushion.map, roughnessMap: X.cushion.rough, normalMap: X.cushion.normal,
       normalScale: new T.Vector2(1.0, 1.0), roughness: 1.0, metalness: 0.0,
-      clearcoat: 0.5, clearcoatRoughness: 0.4, envMap: env
-    }, { grime: 1.0, salt: 0.5 });
+      clearcoat: 0.5, clearcoatRoughness: 0.4, envMap: env, envMapIntensity: 1.5
+    }, { grime: 1.0, salt: 0.5, probe: 1 });
     M.net = patchMat(new T.MeshStandardMaterial({
       map: X.net.map, transparent: true, alphaTest: 0.16, roughness: 0.85,
       metalness: 0.0, side: T.DoubleSide, envMap: env, depthWrite: true
@@ -865,20 +1761,48 @@
       map: X.sheet.map, normalMap: X.sheet.normal, normalScale: new T.Vector2(1.2, 1.2),
       roughness: 0.80, metalness: 0.0, envMap: env
     }, { grime: 1.0, salt: 0.4 });
+    /* The wrap tile is one tube-circumference square, and the rim is a 1.00 m
+       torus, so it goes round exactly 2*pi*0.50 / 0.176 = 17.85 times.  18 is
+       the nearest whole number — a fractional repeat would put a visible
+       half-stitch seam at top dead centre of the wheel, which on the closest
+       prop in the frame is worse than the wrong pitch by a factor of ten. */
+    var lthM = X.leather.map.clone(), lthR = X.leather.rough.clone(), lthN = X.leather.normal.clone();
+    lthM.repeat.set(18, 1); lthR.repeat.set(18, 1); lthN.repeat.set(18, 1);
+    lthM.needsUpdate = lthR.needsUpdate = lthN.needsUpdate = true;
     M.leather = pbr({
-      map: X.leather.map, roughnessMap: X.leather.rough, normalMap: X.leather.normal,
-      normalScale: new T.Vector2(1.1, 1.1), roughness: 1.0, metalness: 0.0, envMap: env
-    }, { grime: 0.9, salt: 0.15, rvar: 0.14 });
+      map: lthM, roughnessMap: lthR, normalMap: lthN,
+      normalScale: new T.Vector2(1.25, 1.25), roughness: 1.0, metalness: 0.0,
+      envMap: env, envMapIntensity: 1.40, clearcoat: 0.22, clearcoatRoughness: 0.55
+    }, { grime: 0.9, salt: 0.10, rvar: 0.0, micro: 0.055, mscale: 480.0, grip: 1,
+         probe: 1 });
     M.rubber = pbr({ color: 0x1b1e20, roughness: 0.82, metalness: 0.0, envMap: env },
-                   { grime: 1.3, salt: 0.2 });
+                   { grime: 1.3, salt: 0.2, micro: 0.140, mscale: 210.0 });
     M.gasket = pbr({ color: 0x14181b, roughness: 0.70, metalness: 0.0, envMap: env },
                    { grime: 1.6, salt: 0.2 });
     M.plastic = pbr({ color: 0x2a3136, roughness: 0.45, metalness: 0.0, clearcoat: 0.4, envMap: env },
-                    { grime: 0.9, salt: 0.4 });
+                    { grime: 0.9, salt: 0.4, micro: 0.075, mscale: 190.0 });
     M.fender = pbr({ color: 0xf3f5f2, roughness: 0.55, metalness: 0.0, clearcoat: 0.5, envMap: env },
-                   { grime: 1.4, salt: 0.8 });
-    M.solar = pbr({ color: 0x0a1424, roughness: 0.12, metalness: 0.35, clearcoat: 1.0,
-                    envMap: env, envMapIntensity: 1.4 }, { grime: 0.5, salt: 0.6, rvar: 0.05 });
+                   { grime: 1.4, salt: 0.8, micro: 0.090, mscale: 130.0 });
+    /* SOLAR GLASS.  Photovoltaic laminate is a sheet of low-iron glass over a
+       near-black cell field: under a Caribbean midday sun the panel is a
+       MIRROR — the rig, the sail and the whole sky sit in it — and rendering
+       it as a dead-black quad is physically impossible in a way the eye
+       notices instantly.  metalness goes to zero (glass is a dielectric; 0.35
+       was tinting the reflection with the base colour and killing it) and the
+       specular is carried entirely by a mirror clearcoat over a black base. */
+    M.solar = pbr({ color: 0x05070d, roughness: 0.30, metalness: 0.0,
+                    clearcoat: 1.0, clearcoatRoughness: 0.028,
+                    envMap: env, envMapIntensity: 2.0 },
+                  { grime: 0.5, salt: 0.6, rvar: 0.05, micro: 0.010, mscale: 260.0 });
+    /* Anodised black aluminium: winch base castings, pedestal collars, clutch
+       bodies.  A hard-anodised casting is not painted plastic and not polished
+       steel — it is a dark, slightly warm, medium-rough metal, and having it
+       under every stainless drum is most of what makes the drum read as a
+       Lewmar rather than as a small metal bin. */
+    M.anod = pbr({
+      color: 0x24262a, roughness: 0.44, metalness: 1.0, envMap: env,
+      envMapIntensity: 1.0
+    }, { grime: 1.1, salt: 0.35, rvar: 0.16, micro: 0.075, mscale: 340.0 });
     M.screen = patchMat(new T.MeshStandardMaterial({
       map: X.screen, emissive: 0xffffff, emissiveMap: X.screen,
       emissiveIntensity: 5.0, roughness: 0.25, metalness: 0.0
@@ -902,77 +1826,191 @@
   }
 
   /* ==========================================================================
-     4.  LOCAL REFLECTION PROBE
+     4.  LOCAL REFLECTION PROBES
      --------------------------------------------------------------------------
      SAIL.sky publishes a PMREM built from the sky dome alone, so everything
      below the horizon in it is black: chrome reflects a gradient, topsides
      have nothing to reflect under the horizon line, and a winch reads as a
-     material-preview sphere.  We render our own cube from a point just above
-     the cockpit hardtop — open sky above, deck and water below — PMREM it,
-     and hand it to every yacht material.  Refreshed at ~2 Hz, which is free
-     at this size and is far more information than a sky-only probe.
+     material-preview sphere.  So we render our own.
+
+     THREE THINGS WERE WRONG WITH THE SINGLE PROBE THIS REPLACES, and together
+     they are the whole "expensive gelcoat reflecting nothing" verdict:
+
+       1. IT WAS PARKED UNDER THE ROOF.  The camera sat at y = 5.20, which is
+          between the flybridge sole (3.78) and the flybridge hardtop (6.05):
+          its entire upper hemisphere was headliner.  Every clearcoat and every
+          metal on the boat was therefore mirroring a large, flat, pale-grey
+          lid — which is exactly what a Lambertian grey card looks like.  Drop
+          a mirror sphere in the frame and you can see it: no sky, no sun, and
+          a horizon squeezed into a band a few degrees high.
+       2. IT WAS PARENTED TO THE HULL.  A CubeCamera bakes its faces along its
+          own WORLD axes, and three then samples every environment map along
+          world axes too.  Hanging the probe off a group whose rotation.y is
+          -heading rotated the entire captured world by the heading, so the
+          sun's reflection sat in the wrong quadrant on every polished surface
+          and swung round as the boat tacked.
+       3. IT WAS SAMPLED AS IF INFINITELY FAR AWAY.  Correct for a sky dome;
+          meaningless for a probe rendered from the middle of a 6 x 5 x 2.5 m
+          box.  Without parallax correction the reflection slides with the
+          CAMERA rather than with the geometry, which reads as a painted-on
+          gradient no matter how sharp the probe is.
+
+     The replacement is two world-axis-aligned probes, both re-positioned from
+     the hull's world matrix every update:
+
+       [0] OPEN   ~0.9 m above the flybridge hardtop.  Full sky, an unbroken
+                  horizon ring, the sea, the rig and the decks.  Sampled as an
+                  infinite environment — correct, because everything in it
+                  except the boat itself is far away.
+       [1] HELM   inside the flybridge volume, beside the wheel.  Contains the
+                  hardtop underside, the coamings, the console, the wheel and
+                  the sea through the open sides.  Sampled BOX-PROJECTED
+                  against the flybridge bounding box, so the horizon line and
+                  the hardtop lip crawl across the coaming as the boat heels.
+
+     Cost is kept flat by refreshing ONE CUBE FACE per tick at 24 Hz and
+     PMREM-ing only on the sixth: a complete pair of probes every half second
+     for the same face rate the single 2 Hz probe used to cost.
      ====================================================================== */
+  var PBS = [
+    /* 9.2 m, not 6.9.  Sitting just clear of the hardtop the probe's whole
+       lower hemisphere is the roof itself — 4 m of grey gelcoat and a
+       near-black solar array — so every down-facing surface on the boat drew
+       its irradiance from the darkest object in the scene and the headliner
+       went to ink.  Three metres higher the roof subtends a quarter of the
+       lower hemisphere and the rest is lit water, which is what a deck fitting
+       at this height actually sees. */
+    { name: 'open', pos: [0, 9.20, 2.20], box: null,
+      cubeRT: null, cam: null, out: null, ok: false },
+    { name: 'helm', pos: [1.35, 5.05, -0.15],
+      // the flybridge volume: sole to hardtop, coaming to coaming
+      box: [[-3.12, 3.66, -2.05], [3.12, 6.06, 3.15]],
+      cubeRT: null, cam: null, out: null, ok: false }
+  ];
   var PB = {
-    cubeRT: null, cam: null, pmrem: null, out: null,
-    acc: 99, ok: false, failed: false, interval: 0.5
+    pmrem: null, failed: false, root: null,
+    acc: 99, idx: 0, face: 0, interval: 1 / 24
   };
 
   function probeInit(root) {
-    if (PB.cubeRT || PB.failed) return;
+    if (PB.pmrem || PB.failed) return;
     var r = SAIL.renderer;
     if (!r || !r.getContext) return;
+    PB.root = root || null;
     try {
-      var sz = LOW() ? 64 : 128;
-      PB.interval = LOW() ? 1.2 : 0.5;
-      PB.cubeRT = new T.WebGLCubeRenderTarget(sz, {
-        type: T.HalfFloatType, format: T.RGBAFormat,
-        minFilter: T.LinearFilter, magFilter: T.LinearFilter, generateMipmaps: false
-      });
-      PB.cam = new T.CubeCamera(0.30, 3000, PB.cubeRT);
-      PB.cam.position.set(0, 5.20, 5.10);      // above the cockpit hardtop
-      PB.cam.name = 'yacht.probe';
-      if (root) root.add(PB.cam);
+      /* 256, not 128.  Reflection sharpness is capped by the probe: every
+         metal and every clearcoat on this boat was reflecting a 128-pixel
+         world, which is why stainless read as painted pipe and no surface
+         anywhere resolved a hard horizon line.  The remaining gap — a sun
+         that CLIPS — is closed analytically by the punctual lobe in
+         patchMat, because no PMREM ever will. */
+      var sz = LOW() ? 96 : 256;
+      PB.interval = LOW() ? 1 / 8 : 1 / 24;
+      for (var i = 0; i < PBS.length; i++) {
+        var p = PBS[i];
+        p.cubeRT = new T.WebGLCubeRenderTarget(sz, {
+          type: T.HalfFloatType, format: T.RGBAFormat,
+          minFilter: T.LinearFilter, magFilter: T.LinearFilter, generateMipmaps: false
+        });
+        p.cam = new T.CubeCamera(0.25, 3000, p.cubeRT);
+        p.cam.name = 'yacht.probe.' + p.name;
+        /* NOT added to the hull group, and never rotated.  The cube has to be
+           captured along world axes or three's world-space lookup samples the
+           wrong face (see note 2 above). */
+      }
       PB.pmrem = new T.PMREMGenerator(r);
       PB.pmrem.compileCubemapShader();
     } catch (e) {
-      PB.failed = true; PB.cubeRT = null; PB.cam = null; PB.pmrem = null;
+      PB.failed = true; PB.pmrem = null;
+      for (var k = 0; k < PBS.length; k++) { PBS[k].cubeRT = null; PBS[k].cam = null; }
     }
   }
 
-  function probeUpdate(dt) {
-    if (!PB.cubeRT || PB.failed) return;
-    PB.acc += isNum(dt) ? dt : 0.016;
-    if (PB.acc < PB.interval) return;
+  /* World position of a model-space point on the hull, and the world AABB of a
+     model-space box.  The hull yaws with the heading, so the box is rebuilt
+     from its eight corners rather than rotated as a box. */
+  var _pw = new T.Vector3(), _pc = new T.Vector3();
+  function probePlace(p) {
+    var root = PB.root || API.group;
+    _pw.set(p.pos[0], p.pos[1], p.pos[2]);
+    if (root) { root.updateMatrixWorld(); _pw.applyMatrix4(root.matrixWorld); }
+    p.cam.position.copy(_pw);
+    p.cam.rotation.set(0, 0, 0);
+    p.cam.updateMatrixWorld(true);
+    if (!p.box) return;
+    var mn = UNI.uBoxMin.value, mx = UNI.uBoxMax.value;
+    mn.set(1e9, 1e9, 1e9); mx.set(-1e9, -1e9, -1e9);
+    for (var i = 0; i < 8; i++) {
+      _pc.set(p.box[(i & 1) ? 1 : 0][0], p.box[(i & 2) ? 1 : 0][1], p.box[(i & 4) ? 1 : 0][2]);
+      if (root) _pc.applyMatrix4(root.matrixWorld);
+      mn.min(_pc); mx.max(_pc);
+    }
+    UNI.uProbeP.value.copy(_pw);
+  }
+
+  function probeUpdate(dt, force) {
+    // build() may run before app.js has published SAIL.renderer; retry here
+    // rather than leaving every metal on the boat reflecting the fallback
+    if (!PB.pmrem && !PB.failed) probeInit(PB.root || API.group);
+    if (!PB.pmrem || PB.failed) return;
     var r = SAIL.renderer, sc = SAIL.scene;
     if (!r || !sc) return;
+    PB.acc += isNum(dt) ? dt : 0.016;
+    /* A settle() step hands us dt = 0.1, and a shot preset has to come up with
+       both probes already correct — so any large step completes the current
+       probe outright instead of dribbling one face into it. */
+    var whole = force || (isNum(dt) && dt >= 0.05);
+    if (!whole && PB.acc < PB.interval) return;
     PB.acc = 0;
     var tmOld = r.toneMapping, sOld = r.shadowMap.autoUpdate, rtOld = r.getRenderTarget();
     try {
       // six extra shadow-map rebuilds would cost more than the probe itself
       r.shadowMap.autoUpdate = false;
       r.toneMapping = T.NoToneMapping;
-      PB.cam.update(r, sc);
-      PB.out = PB.pmrem.fromCubemap(PB.cubeRT.texture, PB.out || null);
-      PB.ok = !!(PB.out && PB.out.texture);
+      var p = PBS[PB.idx];
+      probePlace(p);
+      var n = whole ? 6 - PB.face : 1;
+      for (var k = 0; k < n; k++) {
+        r.setRenderTarget(p.cubeRT, PB.face);
+        r.render(sc, p.cam.children[PB.face]);
+        PB.face++;
+      }
+      if (PB.face >= 6) {
+        PB.face = 0;
+        p.out = PB.pmrem.fromCubemap(p.cubeRT.texture, p.out || null);
+        p.ok = !!(p.out && p.out.texture);
+        PB.idx = (PB.idx + 1) % PBS.length;
+      }
     } catch (e) {
-      PB.failed = true; PB.ok = false;
+      PB.failed = true;
+      for (var q = 0; q < PBS.length; q++) PBS[q].ok = false;
     }
     r.shadowMap.autoUpdate = sOld;
     r.toneMapping = tmOld;
     r.setRenderTarget(rtOld);
   }
 
-  /* Re-bind the environment once a better one exists.  The local probe wins;
-     the sky PMREM is the fallback; the canvas gradient is the last resort. */
-  var _envSeen = null;
+  /* Re-bind the environments once better ones exist.  Each material declared a
+     probe index in patchMat; a probe that has not produced a PMREM yet falls
+     back to the sky map, and then to the canvas gradient, so a metal is never
+     left with nothing to reflect. */
+  var _envSeen = [null, null];
+  function envFor(i) {
+    var p = PBS[i];
+    if (p && p.ok && p.out && p.out.texture) return p.out.texture;
+    return (SAIL.sky && SAIL.sky.envMap) || fallbackEnv();
+  }
   function syncEnv() {
-    var env = (PB.ok && PB.out && PB.out.texture) ? PB.out.texture
-            : ((SAIL.sky && SAIL.sky.envMap) || null);
-    if (!env || env === _envSeen || !M) return;
-    _envSeen = env;
+    if (!M) return;
+    var e0 = envFor(0), e1 = envFor(1);
+    if (e0 === _envSeen[0] && e1 === _envSeen[1]) return;
+    _envSeen[0] = e0; _envSeen[1] = e1;
     for (var k in M) {
       var m = M[k];
-      if (m && m.isMaterial && 'envMap' in m) { m.envMap = env; m.needsUpdate = true; }
+      if (m && m.isMaterial && 'envMap' in m) {
+        var want = (m.__yProbe === 1) ? e1 : e0;
+        if (m.envMap !== want) { m.envMap = want; m.needsUpdate = true; }
+      }
     }
   }
   /* ==========================================================================
@@ -1064,18 +2102,97 @@
     }
     return d;
   }
-  var AODIR = null;
+  /* Cosine-distributed hemisphere, expressed in a LOCAL frame (+Z = normal).
+     ------------------------------------------------------------------------
+     This is the fix for the single loudest artefact on the boat.  The baker
+     used to take ONE world-space Fibonacci sphere and reject whichever half
+     fell below the vertex normal.  On a curved surface — a topside, a
+     coaming radius, a hull bow — the surviving subset changes DISCRETELY as
+     the normal turns, so occ/wsum jumps by several percent from one vertex
+     to the next with no corresponding change in geometry.  Measured on the
+     shipped build that gave the merged hull meshes a per-vertex AO standard
+     deviation of 0.25-0.28, which the indirect term then drew as soft
+     charcoal clouds all over the white gelcoat.  The art director read those
+     clouds as "untextured, dirty, CG"; they were Monte-Carlo noise.
+
+     A fixed set in the LOCAL frame removes it by construction: neighbouring
+     vertices with neighbouring normals sample neighbouring directions, so
+     the estimate is a smooth function of the geometry.  Cosine-weighted, so
+     the estimator is a plain mean and there is no wsum to divide by. */
+  var AOHEMI = null;
+  function aoHemi(n) {
+    var d = [], ga = PI * (3 - Math.sqrt(5));
+    for (var i = 0; i < n; i++) {
+      var u = (i + 0.5) / n;
+      var z = Math.sqrt(1 - u), r = Math.sqrt(u), a = i * ga;
+      d.push(Math.cos(a) * r, Math.sin(a) * r, z);
+    }
+    return d;
+  }
+  /* Weld coincident vertices, then relax over the triangle-edge graph.
+     Two separate jobs:
+       WELD    a merged mesh carries the same corner several times (one per
+               source primitive); if those disagree the merge seam shows as a
+               hard value step down an otherwise continuous panel.
+       RELAX   even a 30-tap estimate keeps a few percent of variance, and a
+               few percent spread over a 6 m topside is exactly the scale the
+               eye reads as a stain.  Three low-weight Laplacian passes remove
+               it without touching the contact gradient, which is a genuine
+               ~15 cm feature and therefore many edges wide. */
+  function aoRelax(geo, out, iters) {
+    var idx = geo.index ? geo.index.array : null;
+    if (!idx || !idx.length) return;
+    var pos = geo.attributes.position.array, N = out.length, i, k;
+    var map = new Map(), rep = new Int32Array(N);
+    for (i = 0; i < N; i++) {
+      var o = i * 3;
+      var key = ((Math.round(pos[o] * 200) + 8192) * 16384 +
+                 (Math.round(pos[o + 1] * 200) + 8192)) * 16384 +
+                 (Math.round(pos[o + 2] * 200) + 8192);
+      var r = map.get(key);
+      if (r === undefined) { map.set(key, i); rep[i] = i; } else rep[i] = r;
+    }
+    var sum = new Float32Array(N), cnt = new Float32Array(N);
+    for (i = 0; i < N; i++) { sum[rep[i]] += out[i]; cnt[rep[i]] += 1; }
+    for (i = 0; i < N; i++) out[i] = sum[rep[i]] / cnt[rep[i]];
+    var acc = new Float32Array(N), deg = new Float32Array(N);
+    for (var it = 0; it < (iters || 3); it++) {
+      acc.fill(0); deg.fill(0);
+      for (k = 0; k + 2 < idx.length; k += 3) {
+        var a = rep[idx[k]], b = rep[idx[k + 1]], c = rep[idx[k + 2]];
+        acc[a] += out[b] + out[c]; deg[a] += 2;
+        acc[b] += out[a] + out[c]; deg[b] += 2;
+        acc[c] += out[a] + out[b]; deg[c] += 2;
+      }
+      for (i = 0; i < N; i++) {
+        var q = rep[i];
+        if (deg[q] > 0.5) out[i] = out[i] * 0.40 + (acc[q] / deg[q]) * 0.60;
+      }
+      // duplicates must stay in lockstep or the weld undoes itself
+      for (i = 0; i < N; i++) if (rep[i] !== i) out[i] = out[rep[i]];
+    }
+  }
   function aoBake(geo, mtx) {
     if (!AOG.g || !geo || !geo.attributes || !geo.attributes.position) return;
     if (!geo.attributes.normal) geo.computeVertexNormals();
     var p = geo.attributes.position.array, nr = geo.attributes.normal.array;
     var N = geo.attributes.position.count, out = new Float32Array(N);
-    if (!AODIR) AODIR = aoDirs(LOW() ? 14 : 26);
-    var D = AODIR, ND = D.length / 3;
+    var cav = new Float32Array(N);
+    if (!AOHEMI) AOHEMI = aoHemi(LOW() ? 14 : 30);
+    var D = AOHEMI, ND = D.length / 3;
     var e = mtx ? mtx.elements : null;
-    // growing step sizes: 1.7 m of reach in 9 taps instead of 15
-    var STEP = [0.14, 0.13, 0.15, 0.18, 0.22, 0.26, 0.31, 0.36, 0.42];
-    var MAXT = 2.17, i, k;
+    /* Growing step sizes: 2.6 m of reach in 10 taps.  Left exactly as it was —
+       the ray start offset (0.105 along the normal) is tuned against the 12 cm
+       voxel so that a grazing ray clears its own surface cell at the FIRST
+       sample, and shortening the first step would self-occlude the whole boat.
+       What is new is that the first three samples are also accumulated
+       SEPARATELY, weighted to zero by 52 cm, into a contact term.  That band
+       is what resolves the winch foot on the teak, the spoke root in the rim
+       and the stanchion through the coaming; a single 2.6 m estimate cannot
+       carry both the room-scale occlusion and the contact line, and asking it
+       to is what left every junction on this boat perfectly clean. */
+    var STEP = [0.13, 0.13, 0.15, 0.17, 0.20, 0.24, 0.29, 0.35, 0.42, 0.50];
+    var MAXT = 2.64, CAVT = 0.52, i, k;
     for (i = 0; i < N; i++) {
       var o = i * 3, px = p[o], py = p[o + 1], pz = p[o + 2];
       var nx = nr[o], ny = nr[o + 1], nz = nr[o + 2];
@@ -1089,19 +2206,27 @@
         var ml = Math.sqrt(mx2 * mx2 + my2 * my2 + mz2 * mz2) || 1;
         px = qx; py = qy; pz = qz; nx = mx2 / ml; ny = my2 / ml; nz = mz2 / ml;
       }
+      var nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (nl < 1e-6) { out[i] = 1; cav[i] = 1; continue; }
+      nx /= nl; ny /= nl; nz /= nl;
+      // orthonormal tangent frame around the normal (Duff et al., branchless)
+      var sg = nz >= 0 ? 1 : -1, ta = -1 / (sg + nz), tb = nx * ny * ta;
+      var tx = 1 + sg * nx * nx * ta, ty = sg * tb, tz = -sg * nx;
+      var bx = tb, by = sg + ny * ny * ta, bz = -ny;
       // start clear of our own surface voxel (half a cell plus a margin)
       var sx = px + nx * 0.105, sy = py + ny * 0.105, sz = pz + nz * 0.105;
-      var occ = 0, wsum = 0;
+      var occ = 0, nearOcc = 0;
       for (k = 0; k < ND; k++) {
-        var dx = D[k * 3], dy = D[k * 3 + 1], dz = D[k * 3 + 2];
-        var nd = dx * nx + dy * ny + dz * nz;
-        if (nd <= 0.06) continue;
-        wsum += nd;
+        var du = D[k * 3], dv = D[k * 3 + 1], dw = D[k * 3 + 2];
+        var dx = tx * du + bx * dv + nx * dw;
+        var dy = ty * du + by * dv + ny * dw;
+        var dz = tz * du + bz * dv + nz * dw;
         var t = 0.06;
         for (var s = 0; s < STEP.length; s++) {
           t += STEP[s];
           if (aoSolid(sx + dx * t, sy + dy * t, sz + dz * t)) {
-            occ += nd * (1 - t / MAXT);
+            occ += (1 - t / MAXT);
+            if (t < CAVT) nearOcc += (1 - t / CAVT);
             break;
           }
         }
@@ -1111,19 +2236,35 @@
          that is the brightest surface in the scene; taking the estimate
          literally is what turns every interior corner into a hole punched in
          the frame instead of a shaded surface you can still read. */
-      var a = wsum > 1e-4 ? 1 - (occ / wsum) * 0.88 : 1;
-      out[i] = clamp(a, 0.13, 1);
+      out[i] = clamp(1 - (occ / ND) * 0.90, 0.13, 1);
+      /* Contact term.  No floor and a hard gain: this one is ALLOWED to go to
+         zero, because a real bedded joint is genuinely black at its root and
+         the whole point of separating it from the broad estimate is that it
+         can be driven hard without turning the cockpit into a cave. */
+      cav[i] = clamp(1 - (nearOcc / ND) * 2.35, 0, 1);
     }
+    try { aoRelax(geo, out, LOW() ? 2 : 3); } catch (e2) { }
+    /* ONE relax pass on the contact term, never three: the whole value of it
+       is that it stays tight against the geometry.  A single pass removes the
+       Monte-Carlo speckle and welds the merge seams; more would smear the
+       band out into exactly the airbrushed blob it replaces. */
+    try { aoRelax(geo, cav, 1); } catch (e3) { }
     geo.setAttribute('aAO', new T.BufferAttribute(out, 1));
+    geo.setAttribute('aCav', new T.BufferAttribute(cav, 1));
   }
   /* Every geometry we hand to a patched material must carry aAO even if the
      baker is skipped, so nothing can render at the GL default. */
   function aoFill(geo, v) {
     if (!geo || !geo.attributes || !geo.attributes.position) return;
-    if (geo.attributes.aAO) return;
-    var n = geo.attributes.position.count, a = new Float32Array(n);
-    a.fill(v === undefined ? 1 : v);
-    geo.setAttribute('aAO', new T.BufferAttribute(a, 1));
+    var n = geo.attributes.position.count, a;
+    if (!geo.attributes.aAO) {
+      a = new Float32Array(n); a.fill(v === undefined ? 1 : v);
+      geo.setAttribute('aAO', new T.BufferAttribute(a, 1));
+    }
+    if (!geo.attributes.aCav) {
+      a = new Float32Array(n); a.fill(1);
+      geo.setAttribute('aCav', new T.BufferAttribute(a, 1));
+    }
   }
 
   /* ==========================================================================
@@ -1201,9 +2342,87 @@
     g.attributes.uv.needsUpdate = true;
     return g;
   }
-  /* Upholstery: a cushion of real thickness with a slight crown and a welted
-     edge, UV'd in metres so the panel pitch is 0.45 m everywhere. */
-  function cush(w, h, d) { return boxUV(w, h, d, 0.90); }
+  /* Upholstery.  A cushion is not a box: the foam crowns in the middle of
+     each panel, rolls over hard at the welted edge, and carries a shallow
+     dish wherever somebody sits.  Rendered as a plain box it is the loudest
+     piece of furniture-catalogue CG in the cockpit — perfectly flat, perfect
+     right-angled corners, no compression anywhere.  Subdivided on a 0.20 m
+     grid so the crown is smooth, then UV'd in metres so the panel pitch is
+     0.45 m on a helm seat and on a 2.6 m sunbed alike. */
+  function cush(w, h, d) {
+    var nx = LOW() ? 3 : clamp(Math.round(w / 0.20), 3, 20);
+    var nz = LOW() ? 3 : clamp(Math.round(d / 0.20), 3, 20);
+    var g = new T.BoxGeometry(w, h, d, nx, Math.max(1, Math.round(h / 0.12)), nz);
+    var p = g.attributes.position.array, n = g.attributes.position.count, i;
+    var hw = w * 0.5, hd = d * 0.5, hh = h * 0.5;
+    for (i = 0; i < n; i++) {
+      var o = i * 3;
+      var fx = p[o] / hw, fy = p[o + 1] / hh, fz = p[o + 2] / hd;
+      // 1 mid-panel, 0 at the welt: the foam is unconstrained in the middle
+      var roll = Math.min(1 - Math.pow(Math.abs(fx), 7), 1 - Math.pow(Math.abs(fz), 7));
+      // seat compression: a broad dish across the middle of the span
+      var dish = Math.exp(-Math.pow(fx * 1.9, 2)) * Math.exp(-Math.pow(fz * 1.5, 2));
+      var lift = (0.20 * roll - 0.13 * dish) * h;
+      if (fy > 0.5) p[o + 1] += lift;
+      else if (fy < -0.5) p[o + 1] += lift * 0.18;      // the base follows a little
+      // pinch the sides in toward the welt so the edge reads as rolled piping
+      var pin = 1 - 0.085 * (1 - Math.abs(fy));
+      p[o] *= pin; p[o + 2] *= pin;
+    }
+    g.computeVertexNormals();
+    var a = g.attributes.uv.array, nr = g.attributes.normal.array;
+    for (i = 0; i < n; i++) {
+      var o2 = i * 3, ax = Math.abs(nr[o2]), ay = Math.abs(nr[o2 + 1]), az = Math.abs(nr[o2 + 2]);
+      var u, v;
+      if (ax >= ay && ax >= az) { u = p[o2 + 2]; v = p[o2 + 1]; }
+      else if (ay >= az) { u = p[o2]; v = p[o2 + 2]; }
+      else { u = p[o2]; v = p[o2 + 1]; }
+      a[i * 2] = u / 0.90; a[i * 2 + 1] = v / 0.90;
+    }
+    g.attributes.uv.needsUpdate = true;
+    /* THE WELT.  Piping is a cord sewn into the seam, and it is the one edge
+       on a cushion that is genuinely round: it catches a continuous highlight
+       all the way round the panel and it throws a hairline shadow onto the
+       face below it.  Painted into the albedo — which is what the previous
+       version did — it is a blurry smear with no thickness, and a magnified
+       texel is exactly how a cushion ends up the least convincing object in a
+       cockpit.  Ten millimetres of actual swept geometry costs a few hundred
+       triangles and fixes it outright. */
+    if (!LOW()) {
+      var hwp = hw * 0.915, hdp = hd * 0.915;      // the pinched perimeter
+      var cr = Math.min(hwp, hdp) * 0.28;          // corner radius of the seam
+      var pts = [], seg = 5, kq, j2;
+      function corner(cx2, cz2, a0) {
+        for (j2 = 0; j2 <= seg; j2++) {
+          var aa = a0 + (j2 / seg) * (PI / 2);
+          pts.push([cx2 + Math.cos(aa) * cr, 0, cz2 + Math.sin(aa) * cr]);
+        }
+      }
+      // four straights linked by four quarter-round corners
+      corner(hwp - cr, hdp - cr, 0);
+      pts.push([-(hwp - cr), 0, hdp]);
+      corner(-(hwp - cr), hdp - cr, PI / 2);
+      pts.push([-hwp, 0, -(hdp - cr)]);
+      corner(-(hwp - cr), -(hdp - cr), PI);
+      pts.push([hwp - cr, 0, -hdp]);
+      corner(hwp - cr, -(hdp - cr), -PI / 2);
+      pts.push([hwp, 0, hdp - cr]);
+      var wl = [g];
+      for (kq = 0; kq < pts.length; kq++) {
+        var pA = pts[kq], pB = pts[(kq + 1) % pts.length];
+        if (Math.abs(pA[0] - pB[0]) + Math.abs(pA[2] - pB[2]) < 1e-4) continue;
+        var rg = rod(pA, pB, 0.0105, 7);
+        /* Park the cord's UVs inside one quiet patch of the fabric tile: a
+           10 mm tube whose u runs the full 0..1 would wrap an entire cushion
+           panel — welt, stitch rows and all — round its own circumference. */
+        var ru = rg.attributes.uv.array;
+        for (j2 = 0; j2 < ru.length; j2++) ru[j2] = 0.22 + ru[j2] * 0.05;
+        wl.push(rg);
+      }
+      return mergeAll(wl);
+    }
+    return g;
+  }
   function cyl(rt, rb, h, rs, hs, open) {
     return new T.CylinderGeometry(rt, rb, h, rs || (LOW() ? 8 : 14), hs || segCount(h), !!open);
   }
@@ -1580,7 +2799,51 @@
      ====================================================================== */
   function hullStations() {
     var L = S.loa, hb = S.hullBeam / 2, canoe = S.canoe;
-    var NS = LOW() ? 24 : 36, NP = LOW() ? 8 : 12, st = [];
+    /* THE STAIRCASE, AND WHY MORE POLYGONS DO NOT FIX IT.
+       ----------------------------------------------------------------------
+       loftHullParts classifies each QUAD into antifoul / boot / band / gel by
+       the mean height of its four corners, so the waterline and the boot top
+       are quantised to whatever girth row happens to be nearest.  Solving
+       y(s) = keel + (sheer - keel) * s^1.45 for y = 0.02 and y = 0.25 shows
+       why raising NP alone cannot help: at midship those two land at
+       s = 0.539 and 0.615, but at the stem — where keel has risen to -0.06
+       and sheer to 2.36 — they land at s = 0.104 and 0.259.  The boot band
+       SWEEPS ACROSS THE GIRTH PARAMETER from one end of the boat to the
+       other, so no fixed sampling of s can hold it, and a uniform grid
+       leaves a 15 m black-to-white boundary carried by one row of quads.
+       That is the "polygon stair-stepping at the bows".
+
+       Fix: make two of the girth rows BE the waterline and the boot top.
+       Row index is canonical (row 8 is the waterline at every station, row
+       11 the boot top), and each station solves for the s that puts that row
+       at the right height, with the remaining rows distributed linearly in
+       between.  The rows then trace the real contours, the classification
+       tests an INTEGER row index instead of an interpolated height, and the
+       boundary is exact everywhere.  Two further rows are pinned for the
+       topside band so that stripe is exact too. */
+    var NS = LOW() ? 26 : 44, NP = LOW() ? 12 : 26, st = [];
+    var K = {
+      iWL: Math.max(2, Math.round(NP * 0.31)),      // waterline row
+      iBT: Math.max(3, Math.round(NP * 0.43)),      // boot-top row
+      iB0: Math.round(NP * 0.77),                   // topside band, lower
+      iB1: Math.round(NP * 0.925),                  // topside band, upper
+      iG0: Math.round(NP * 0.805),                  // hull window, lower
+      iG1: Math.round(NP * 0.895)                   // hull window, upper
+    };
+    if (K.iBT <= K.iWL) K.iBT = K.iWL + 1;
+    if (K.iB1 <= K.iB0) K.iB1 = K.iB0 + 1;
+    if (K.iG1 <= K.iG0) K.iG1 = K.iG0 + 1;
+    /* Girth parameter of row j on a station with this keel and sheer, with
+       rows iWL and iBT pinned to y = 0.02 and y = 0.25 exactly. */
+    function sRow(j, keel, sheer) {
+      var d = Math.max(sheer - keel, 0.05);
+      var fw = clamp((0.02 - keel) / d, 0.010, 0.880);
+      var fb = clamp((0.25 - keel) / d, fw + 0.020, 0.945);
+      var sw = Math.pow(fw, 1 / 1.45), sb = Math.pow(fb, 1 / 1.45);
+      if (j <= K.iWL) return sw * (j / K.iWL);
+      if (j <= K.iBT) return sw + (sb - sw) * (j - K.iWL) / (K.iBT - K.iWL);
+      return sb + (1 - sb) * (j - K.iBT) / (NP - K.iBT);
+    }
     for (var i = 0; i <= NS; i++) {
       var t = -Math.cos(i / NS * PI);                     // -1 transom .. +1 stem
       var fore = t * L / 2;
@@ -1593,7 +2856,7 @@
       var sheer = 1.62 + 0.68 * Math.pow(Math.max(0, t), 2.2) + 0.06 * t;
       var pts = [];
       for (var j = 0; j <= NP; j++) {
-        var s = j / NP;
+        var s = sRow(j, keel, sheer);
         // a soft chine near s = 0.62 keeps the topsides slab-sided like the real hull
         var kn = 1 + 0.10 * Math.exp(-Math.pow((s - 0.62) / 0.13, 2));
         pts.push([halfB * Math.pow(Math.sin(s * PI / 2), 0.62) * kn,
@@ -1601,7 +2864,7 @@
       }
       st.push({ fore: fore, pts: pts, keel: keel, sheer: sheer, halfB: halfB });
     }
-    var H = { st: st, NS: NS, NP: NP };
+    var H = { st: st, NS: NS, NP: NP, knots: K };
     H.tOf = function (z) { return clamp(-z / (S.loa / 2), -1, 1); };
     H.sheerAt = function (z) {
       var t = H.tOf(z);
@@ -1621,6 +2884,9 @@
      near it, so they hug the loft exactly and can never z-fight or poke out. */
   function loftHullParts(H, outSign) {
     var st = H.st, NS = H.NS, NP = H.NP;
+    var K = H.knots || { iWL: Math.round(NP * 0.31), iBT: Math.round(NP * 0.43),
+                         iB0: Math.round(NP * 0.77), iB1: Math.round(NP * 0.925),
+                         iG0: Math.round(NP * 0.805), iG1: Math.round(NP * 0.895) };
     var pos = [], uv = [], ring = [], i, j;
     function push(fore, stbd, up, u, v) {
       pos.push(stbd, up, -fore); uv.push(u, v);
@@ -1639,16 +2905,17 @@
       var fm = (st[i].fore + st[i + 1].fore) / 2;
       for (j = 0; j < M2 - 1; j++) {
         var a = ring[i][j], b = ring[i][j + 1], c = ring[i + 1][j + 1], d = ring[i + 1][j];
-        var ym = (pos[a * 3 + 1] + pos[b * 3 + 1] + pos[c * 3 + 1] + pos[d * 3 + 1]) / 4;
-        var jm = j + 0.5, sv = Math.abs(jm - NP) / NP;
+        // integer row band, not an interpolated height: rows iWL and iBT ARE
+        // the waterline and the boot top, so the boundary cannot stair-step
+        var jm = j + 0.5, jd = Math.abs(jm - NP);
         var outb = ((jm < NP) ? 1 : -1) === outSign;
         var key;
-        if (ym < 0.02) key = 'anti';
-        else if (ym < 0.25) key = 'boot';
-        else if (outb && sv > 0.78 && sv < 0.945 && fm > -5.6 && fm < 5.4) {
+        if (jd < K.iWL) key = 'anti';
+        else if (jd < K.iBT) key = 'boot';
+        else if (outb && jd > K.iB0 && jd < K.iB1 && fm > -5.6 && fm < 5.4) {
           key = 'band';
           for (var w = 0; w < WIN.length; w++) {
-            if (sv > 0.805 && sv < 0.915 && fm > WIN[w][0] && fm < WIN[w][1]) key = 'glass';
+            if (jd > K.iG0 && jd < K.iG1 && fm > WIN[w][0] && fm < WIN[w][1]) key = 'glass';
           }
         } else key = 'gel';
         B[key].push(a, b, c, a, c, d);
@@ -1656,20 +2923,57 @@
     }
     var tr = st[0], cc = push(tr.fore, 0, (tr.keel + tr.sheer) / 2, 0.5, 0);
     for (j = 0; j < M2 - 1; j++) {
-      var yt = (pos[ring[0][j] * 3 + 1] + pos[ring[0][j + 1] * 3 + 1]) / 2;
-      B[yt < 0.02 ? 'anti' : yt < 0.25 ? 'boot' : 'gel'].push(ring[0][j + 1], ring[0][j], cc);
+      var jt = Math.abs(j + 0.5 - NP);
+      B[jt < K.iWL ? 'anti' : jt < K.iBT ? 'boot' : 'gel'].push(ring[0][j + 1], ring[0][j], cc);
     }
     var bw = st[NS], c2 = push(bw.fore + 0.06, 0, (bw.keel + bw.sheer) / 2, 0.5, 4);
     for (j = 0; j < M2 - 1; j++) B.gel.push(ring[NS][j], ring[NS][j + 1], c2);
 
-    var out = {};
-    for (var key2 in B) {
-      if (!B[key2].length) continue;
+    /* NORMALS ARE COMPUTED ONCE, ON THE WHOLE SHELL.
+       Each region used to run its own computeVertexNormals(), which averages
+       only the triangles that region happens to own — so every vertex on the
+       boot-top line, the topside band and the window surrounds got a normal
+       built from HALF its true neighbourhood.  That is a shading crease down
+       four continuous seams of a continuous surface, and at the bows, where
+       the seams cross the hardest curvature, it reads as faceting on the
+       chine.  One pass over the union of every region's triangles gives every
+       vertex its real normal, and the regions then just borrow it. */
+    var allIdx = [], key2;
+    for (key2 in B) if (B[key2].length) allIdx = allIdx.concat(B[key2]);
+    var whole = new T.BufferGeometry();
+    whole.setAttribute('position', new T.Float32BufferAttribute(pos.slice(0), 3));
+    whole.setIndex(allIdx);
+    whole.computeVertexNormals();
+    var NRM = whole.attributes.normal.array;
+    whole.dispose();
+
+    /* Emit only the vertices each region actually references.  The shared
+       pool is ~2400 vertices; the boot top touches maybe 250 of them, and
+       copying all 2400 into all five regions is what made the denser
+       stations expensive — both in buffer size and, far more, in AO bake
+       time, which is per-vertex whether the vertex is drawn or not. */
+    var out = {}, nv = pos.length / 3;
+    var remap = new Int32Array(nv), stamp = new Int32Array(nv), tag = 0;
+    for (key2 in B) {
+      var src = B[key2];
+      if (!src.length) continue;
+      tag++;
+      var P2 = [], U2 = [], N2 = [], I2 = [];
+      for (var q2 = 0; q2 < src.length; q2++) {
+        var vi = src[q2];
+        if (stamp[vi] !== tag) {
+          stamp[vi] = tag; remap[vi] = P2.length / 3;
+          P2.push(pos[vi * 3], pos[vi * 3 + 1], pos[vi * 3 + 2]);
+          U2.push(uv[vi * 2], uv[vi * 2 + 1]);
+          N2.push(NRM[vi * 3], NRM[vi * 3 + 1], NRM[vi * 3 + 2]);
+        }
+        I2.push(remap[vi]);
+      }
       var g = new T.BufferGeometry();
-      g.setAttribute('position', new T.Float32BufferAttribute(pos.slice(0), 3));
-      g.setAttribute('uv', new T.Float32BufferAttribute(uv.slice(0), 2));
-      g.setIndex(B[key2]);
-      g.computeVertexNormals();
+      g.setAttribute('position', new T.Float32BufferAttribute(P2, 3));
+      g.setAttribute('uv', new T.Float32BufferAttribute(U2, 2));
+      g.setAttribute('normal', new T.Float32BufferAttribute(N2, 3));
+      g.setIndex(I2);
       out[key2] = g;
     }
     return out;
@@ -1892,8 +3196,9 @@
      a hot line of light.  All of that is linear shading structure the AO
      bake and the bounce term then have something to work with.
      ------------------------------------------------------------------------ */
-  function hardtopUnder(A, x, y, z, w, d, tubeX, nBat) {
+  function hardtopUnder(A, x, y, z, w, d, tubeX, nBat, matV) {
     var i, s;
+    matV = matV || M.gelGrey;
     /* The headliner is split into four bays by the carry tubes and battens,
        each with its own UV origin, so the weave never marches across the
        whole panel as one continuous tile.  The tile is 0.30 m, which puts a
@@ -1906,6 +3211,23 @@
       // seams of one bay never line up with the seams of the next
       var ua = pg.attributes.uv.array;
       for (i = 0; i < ua.length; i += 2) { ua[i] += s * 1.53; ua[i + 1] += s * 0.71; }
+      /* CATENARY SAG.  Fabric stretched between battens is not a plane — it
+         hangs.  Twelve millimetres over a 2.5 m bay is barely a measurement,
+         but it is the difference between a surface whose shading gradient
+         turns continuously across the panel and a flat quad that returns one
+         value across the whole top third of the frame.  It also gives the
+         batten lines something to pinch against, which is what makes them
+         read as pockets rather than as painted stripes. */
+      var pp = pg.attributes.position.array;
+      for (i = 0; i < pp.length; i += 3) {
+        var fu = pp[i] / (bw * 0.5), fv = pp[i + 2] / (bd * 0.5);
+        var sagU = 1 - fu * fu, sagV = 1 - fv * fv;
+        // the battens run athwartships, so the sag is deeper along z.  The
+        // plate is flipped through PI about X when it is placed, so LOCAL +y
+        // is model -y: the fabric hangs by ADDING here.
+        pp[i + 1] += 0.0135 * sagU * sagU * sagV + 0.008 * sagV * sagV;
+      }
+      pg.computeVertexNormals();
       A.add(at(pg, x + ox, y - 0.028, z + oz, PI, 0, 0), M.liner);
     }
     // recessed LED pucks in the headliner, on the fore-and-aft centre lines
@@ -1920,18 +3242,33 @@
                y - 0.024, z - d / 2 + 0.16 + i * ((d - 0.32) / 5)), M.steel);
     }
     // perimeter valance, rounded so the leading edge carries a specular line
-    A.add(at(cyl(0.055, 0.055, w, LOW() ? 6 : 10), x, y + 0.012, z - d / 2 + 0.045, 0, 0, PI / 2), M.gelGrey);
-    A.add(at(cyl(0.055, 0.055, w, LOW() ? 6 : 10), x, y + 0.012, z + d / 2 - 0.045, 0, 0, PI / 2), M.gelGrey);
-    A.add(at(cyl(0.050, 0.050, d, LOW() ? 6 : 10), x - w / 2 + 0.045, y + 0.012, z, PI / 2, 0, 0), M.gelGrey);
-    A.add(at(cyl(0.050, 0.050, d, LOW() ? 6 : 10), x + w / 2 - 0.045, y + 0.012, z, PI / 2, 0, 0), M.gelGrey);
-    // fore-and-aft carry tubes
+    A.add(at(cyl(0.055, 0.055, w, LOW() ? 6 : 14), x, y + 0.012, z - d / 2 + 0.045, 0, 0, PI / 2), matV);
+    A.add(at(cyl(0.055, 0.055, w, LOW() ? 6 : 14), x, y + 0.012, z + d / 2 - 0.045, 0, 0, PI / 2), matV);
+    A.add(at(cyl(0.050, 0.050, d, LOW() ? 6 : 14), x - w / 2 + 0.045, y + 0.012, z, PI / 2, 0, 0), matV);
+    A.add(at(cyl(0.050, 0.050, d, LOW() ? 6 : 14), x + w / 2 - 0.045, y + 0.012, z, PI / 2, 0, 0), matV);
+    /* Carry tubes and battens are POWDER-COATED aluminium, not stainless.
+       Every tube on a production cat sharing one polished-chrome material is
+       half of why the structure reads as a CAD assembly: the coated members
+       are semi-matte and slightly warm, and that contrast against the
+       stainless grab rail 200 mm away is what gives the underside of a
+       hardtop its material hierarchy. */
     for (s = -1; s <= 1; s += 2) {
-      A.add(at(cyl(0.042, 0.042, d - 0.14, LOW() ? 6 : 10), x + s * tubeX, y - 0.052, z, PI / 2, 0, 0), M.steelSat);
+      A.add(at(cyl(0.042, 0.042, d - 0.14, LOW() ? 6 : 10), x + s * tubeX, y - 0.052, z, PI / 2, 0, 0), M.powder);
     }
-    // batten pockets behind the panel: the dark bands that give it depth
+    /* Batten pockets behind the panel: the dark bands that give it depth, and
+       the DOUBLE ROW OF STITCHING that closes each pocket.  A sewn pocket is
+       two 3 mm seams 40 mm apart running the full width, and they are the only
+       high-frequency line work anywhere on two square metres of canvas — the
+       thing that stops the whole top third of the noon frame reading as one
+       untextured grey slab.  Sewn in the fabric colour, not black: a contrast
+       stitch here would read as a decal. */
     for (i = 0; i < nBat; i++) {
       var bz = z - d / 2 + (d / nBat) * (i + 0.5);
-      A.add(at(cyl(0.028, 0.028, w - 0.20, LOW() ? 5 : 8), x, y - 0.048, bz, 0, 0, PI / 2), M.steelSat);
+      A.add(at(cyl(0.028, 0.028, w - 0.20, LOW() ? 5 : 10), x, y - 0.048, bz, 0, 0, PI / 2), M.powder);
+      if (!LOW()) for (s = -1; s <= 1; s += 2) {
+        A.add(at(box(w - 0.30, 0.004, 0.0055), x, y - 0.0335, bz + s * 0.042), M.canvasCream);
+        A.add(at(box(w - 0.30, 0.003, 0.0030), x, y - 0.0315, bz + s * 0.042), M.gasket);
+      }
     }
     /* Overhead grab rails on the outboard edge, standing 60 mm proud on
        machined feet.  They are the one thing everybody reaches for coming up
@@ -1981,11 +3318,33 @@
     for (i = 0; i < 4; i++) {
       A.add(at(box(5.64, 0.03, 0.035), 0, S.yBimini + 0.226, -1.05 + i * 1.10), M.steelSat);
     }
-    hardtopUnder(A, 0, S.yBimini + 0.02, 0.60, 6.20, 5.20, 2.62, LOW() ? 4 : 7);
+    hardtopUnder(A, 0, S.yBimini + 0.02, 0.60, 6.20, 5.20, 2.62, LOW() ? 4 : 7, M.gelIn);
+    /* HARDTOP POSTS.  These are the only piece of the yacht that the noon
+       preset shows in full length, and they were failing at both ends: 10
+       radial segments cannot carry a smooth specular gradient across a 90 mm
+       tube at two metres, and the tube simply stopped at the sole with a
+       bedding washer, so the highlight ran out into a black stub instead of
+       terminating on a real fitting.  A production cat lands each post on a
+       machined base flange, through a sealant bead, with four countersunk
+       bolts, and there is a swaged collar where the tube enters the flange.
+       That is four turned parts and it is what makes the bottom of the post
+       read as bolted through a deck rather than as a pipe pushed into it. */
     for (s = -1; s <= 1; s += 2) for (i = 0; i < 2; i++) {
-      A.add(at(cyl(0.045, 0.052, S.yBimini - S.yFly, 10),
-               s * 2.72, (S.yBimini + S.yFly) / 2, i ? 2.90 : -1.70), M.steelSat);
-      gasket(A, s * 2.72, S.yFly + 0.02, i ? 2.90 : -1.70, 0.068, 0.020);
+      var pz2 = i ? 2.90 : -1.70, px2 = s * 2.72;
+      A.add(at(cyl(0.045, 0.052, S.yBimini - S.yFly, LOW() ? 12 : 26),
+               px2, (S.yBimini + S.yFly) / 2, pz2), M.steel);
+      // swaged collar, base flange, sealant bead, bolt heads
+      A.add(at(cyl(0.058, 0.072, 0.075, LOW() ? 12 : 26), px2, S.yFly + 0.098, pz2), M.steel);
+      A.add(at(cyl(0.088, 0.094, 0.028, LOW() ? 12 : 26), px2, S.yFly + 0.046, pz2), M.steelSat);
+      A.add(at(cyl(0.098, 0.104, 0.014, LOW() ? 12 : 26), px2, S.yFly + 0.024, pz2), M.steel);
+      A.add(at(tor(0.101, 0.007, LOW() ? 5 : 8, LOW() ? 12 : 26),
+               px2, S.yFly + 0.014, pz2, PI / 2), M.gasket);
+      for (var kb = 0; kb < 4; kb++) {
+        var ab = kb * PI / 2 + PI / 4;
+        A.add(at(cyl(0.010, 0.010, 0.008, LOW() ? 6 : 12),
+                 px2 + Math.cos(ab) * 0.076, S.yFly + 0.064, pz2 + Math.sin(ab) * 0.076), M.steelSat);
+      }
+      gasket(A, px2, S.yFly + 0.008, pz2, 0.108, 0.016);
     }
     // davit arch aft
     for (s = -1; s <= 1; s += 2) {
@@ -2040,12 +3399,21 @@
     wa.push(at(cyl(r * 0.895, r * 0.885, 0.055, NS, 1, true), 0, 0.1275, 0));
     wa.push(at(cyl(r * 0.965, r * 0.895, 0.050, NS, 1, true), 0, 0.180, 0));
     wa.push(at(cyl(r * 1.005, r * 0.965, 0.026, NS, 1, true), 0, 0.218, 0));
-    // knurl: vertical gripping ribs standing 1.5 mm proud of the drum
+    /* KNURL.  A Lewmar rib is MACHINED, not extruded: the flanks are radial
+       and the top is a flat land about 2 mm wide with a chamfer either side,
+       so the sun draws a fine broken line of hard highlights round the drum
+       rather than clipping a solid white band across every rib top.  A square
+       box section has neither, which is exactly why the drum was reading as a
+       ribbed bin.  Two stacked boxes approximate the land-and-chamfer
+       section for the cost of one extra quad per rib. */
     var NK = LOW() ? 0 : 22;
     for (i = 0; i < NK; i++) {
       var a = i / NK * TAU;
-      wa.push(at(box(0.0075, 0.155, 0.0075),
-                 Math.cos(a) * r * 0.918, 0.108, Math.sin(a) * r * 0.918, 0, -a, 0));
+      var cx = Math.cos(a), cz = Math.sin(a);
+      wa.push(at(box(0.0082, 0.155, 0.0060),
+                 cx * r * 0.914, 0.108, cz * r * 0.914, 0, -a, 0));
+      wa.push(at(box(0.0044, 0.150, 0.0038),
+                 cx * r * 0.922, 0.108, cz * r * 0.922, 0, -a, 0));
     }
     // self-tailing jaws: two sprung rings with a rope-sized gap between them
     wa.push(at(tor(r * 1.02, 0.018, LOW() ? 6 : 12, NS), 0, 0.243, 0, PI / 2));
@@ -2054,10 +3422,137 @@
     // handle socket, square drive, sunk into the crown
     wa.push(at(cyl(r * 0.56, r * 0.58, 0.030, LOW() ? 10 : 24), 0, 0.283, 0));
     wa.push(at(box(0.030, 0.014, 0.030), 0, 0.292, 0));
+    return mergeAll(wa);
+  }
+  /* The parts of the winch that are ANODISED BLACK on the real thing: the
+     stripper arm and its boss, the gear-case parting line round the base of
+     the drum, and the pawl-inspection slot.  Splitting them out of the
+     stainless is most of what turns "a small metal bin with a blue gasket"
+     into a recognisable self-tailing winch — a Lewmar is two materials, and
+     the dark ring under the bright drum is the read. */
+  function winchDark(r) {
+    var wa = [], NS = LOW() ? 16 : 32;
     // stripper arm: the hook that peels the tail out of the jaws
     wa.push(at(box(0.030, 0.040, r * 0.95), r * 0.72, 0.250, 0));
     wa.push(at(box(0.030, 0.055, 0.035), r * 0.72, 0.235, -r * 0.46));
+    wa.push(at(cyl(0.020, 0.024, 0.030, LOW() ? 8 : 16), r * 0.72, 0.232, 0));
+    // gear-case parting line: a 3 mm proud collar right at the drum foot
+    wa.push(at(cyl(r * 1.045, r * 1.045, 0.010, NS), 0, 0.004, 0));
+    wa.push(at(cyl(r * 1.015, r * 1.030, 0.014, NS), 0, 0.016, 0));
+    // pawl slot, and the two case screws either side of it
+    wa.push(at(box(0.007, 0.020, r * 0.7), -r * 0.75, 0.012, 0, 0, 0.5, 0));
     return mergeAll(wa);
+  }
+  /* Three turns of sheet on a drum are not three smooth tori.  A working wrap
+     climbs the throat, changes radius as it rides up the taper, and the braid
+     itself is a helix — so each turn is swept as its own tube with a per-turn
+     radius and a slight pitch, and the rope material's own braid normal then
+     lands on a surface whose tangent actually follows the lay. */
+  function ropeWrap(r) {
+    var list = [], NSEG = LOW() ? 14 : 34, k, i;
+    var turns = [
+      { y: 0.049, rad: r * 1.055, tr: 0.0122 },
+      { y: 0.076, rad: r * 1.020, tr: 0.0120 },
+      { y: 0.103, rad: r * 1.030, tr: 0.0118 }
+    ];
+    for (k = 0; k < turns.length; k++) {
+      var t = turns[k], pts = [];
+      for (i = 0; i <= NSEG; i++) {
+        var a = i / NSEG * TAU;
+        // the turn is not a perfect circle: it is pulled toward the lead
+        var rr = t.rad * (1 + 0.014 * Math.cos(a * 1.0 + k * 1.7));
+        pts.push([Math.cos(a) * rr, t.y + 0.0075 * (i / NSEG), Math.sin(a) * rr]);
+      }
+      for (i = 0; i < NSEG; i++) list.push(at(rod(pts[i], pts[i + 1], t.tr, LOW() ? 4 : 6), 0, 0, 0));
+    }
+    return mergeAll(list);
+  }
+
+  /* ------------------------------------------------------------------------
+     CLUTTER.  A boat that is being sailed is not a showroom: there are rope
+     tails flaked on the coaming, a winch handle in its holster, a towel over
+     the rail, a soft bag wedged under the table.  None of it is expensive —
+     everything below merges into the existing accumulators, so it costs
+     triangles and no draw calls — but it is what puts a crew on board.
+     ---------------------------------------------------------------------- */
+  function ropeCoil(A, x, y, z, r0, turns, mat, tilt) {
+    var segs = LOW() ? 12 : 24, list = [], k;
+    for (k = 0; k < turns; k++) {
+      // radius falls and the coil stacks as the tail runs out
+      list.push(at(tor(r0 * (1 - 0.115 * k), 0.0118, LOW() ? 5 : 7, segs),
+                   0.006 * k, 0.0135 * k, -0.004 * k, PI / 2, 0, 0.55 * k));
+    }
+    A.add(at(mergeAll(list), x, y, z, tilt || 0, 0, 0), mat);
+  }
+  /* A winch handle: square drive, forged arm, floating grip.  Left in its
+     holster because that is where it lives between tacks. */
+  function winchHandle(A, x, y, z, ry, tilt) {
+    var g = [
+      at(box(0.040, 0.040, 0.056), 0, 0, 0),                     // drive head
+      at(box(0.026, 0.030, 0.215), 0, 0.008, 0.140)              // forged arm
+    ];
+    var grip = at(cyl(0.020, 0.020, 0.115, LOW() ? 6 : 12), 0, 0.070, 0.243);
+    A.add(at(mergeAll(g), x, y, z, tilt || 0, ry || 0, 0), M.steelSat);
+    A.add(at(grip, x, y, z, tilt || 0, ry || 0, 0), M.rubber);
+  }
+  /* A folded towel over a coaming: three tapering slabs with a soft break at
+     the fold, so it drapes instead of reading as a plastic card. */
+  function towel(A, x, y, z, w, drop, mat) {
+    var g = [];
+    g.push(at(box(w, 0.022, 0.30), 0, 0, 0));                        // over the top
+    g.push(at(box(w * 0.98, drop, 0.020), 0, -drop / 2, -0.148, 0.10));
+    g.push(at(box(w * 0.94, drop * 0.72, 0.020), 0, -drop * 0.36, 0.150, -0.13));
+    A.add(at(mergeAll(g), x, y, z), mat);
+  }
+  function softBag(A, x, y, z, w, h, d, mat) {
+    var g = [];
+    g.push(at(sph(0.5, LOW() ? 8 : 14, LOW() ? 6 : 10), 0, 0, 0, 0, 0, 0, w, h, d));
+    g.push(at(cyl(0.012, 0.012, w * 0.62, LOW() ? 5 : 8), 0, h * 0.52, 0, 0, 0, PI / 2));
+    A.add(at(mergeAll(g), x, y, z), mat);
+  }
+
+  function buildClutter(A, root, P) {
+    var yC = S.yCock, cT = yC + S.coam, s;
+    // winch handle in its holster, port coaming, drive end down
+    winchHandle(A, -2.92, cT - 0.10, 4.32, 0.22, -0.34);
+    // a second handle stowed flat in the flybridge pocket
+    winchHandle(A, 1.92, S.yFly + 0.10, -1.05, PI * 0.5, 0.0);
+    // dock lines flaked down in the aft corners of the cockpit sole
+    ropeCoil(A, 2.34, yC + 0.035, 6.05, 0.215, LOW() ? 3 : 6, M.rope, 0.05);
+    ropeCoil(A, -2.34, yC + 0.035, 6.05, 0.205, LOW() ? 3 : 6, M.rope, -0.04);
+    // spare sheet coiled at the mast base on the coachroof
+    ropeCoil(A, 0.62, S.mastBase + 0.05, S.mastZ + 0.55, 0.185, LOW() ? 3 : 5, M.sheet, 0.0);
+    // towel over the port coaming, and one over the transom rail
+    towel(A, -3.03, cT + 0.075, 5.55, 0.44, 0.30, M.canvasCream);
+    towel(A, 1.42, cT + 0.075, 7.05, 0.38, 0.26, M.canvasNavy);
+    // soft bag wedged under the cockpit table, and a cooler on the sole
+    softBag(A, 0.72, yC + 0.19, 5.98, 0.46, 0.34, 0.32, M.canvasNavy);
+    A.add(at(box(0.46, 0.34, 0.32), -1.30, yC + 0.17, 6.05, 0, 0.22, 0), M.plastic);
+    A.add(at(box(0.48, 0.035, 0.34), -1.30, yC + 0.352, 6.05, 0, 0.22, 0), M.gelGrey);
+    // throw cushions tossed on the aft bench, at angles nobody arranged
+    A.add(at(cush(0.42, 0.11, 0.40), -1.95, yC + 0.60, 6.62, 0.06, 0.34, 0.03), M.cushion);
+    A.add(at(cush(0.40, 0.10, 0.38), -1.55, yC + 0.60, 6.55, -0.04, -0.22, 0.05), M.cushion);
+    A.add(at(cush(0.44, 0.11, 0.40), 1.70, yC + 0.60, 6.60, 0.03, -0.41, -0.04), M.cushion);
+    // boathook clipped along the coachroof side, in two nylon clips
+    for (s = -1; s <= 1; s += 2) {
+      if (s < 0) continue;
+      A.add(at(cyl(0.017, 0.019, 2.30, LOW() ? 6 : 10), s * 2.66, S.yRoof + 0.115, -1.05, PI / 2), M.powder);
+      A.add(at(cyl(0.016, 0.016, 0.14, LOW() ? 6 : 10), s * 2.66, S.yRoof + 0.115, -2.26, PI / 2), M.steelSat);
+      A.add(at(tor(0.048, 0.013, 6, LOW() ? 8 : 14), s * 2.66, S.yRoof + 0.155, -2.34, 0, 0, PI / 2), M.steelSat);
+      A.add(at(box(0.05, 0.055, 0.05), s * 2.66, S.yRoof + 0.075, -0.20), M.plastic);
+      A.add(at(box(0.05, 0.055, 0.05), s * 2.66, S.yRoof + 0.075, -1.90), M.plastic);
+    }
+    // a bucket upturned by the transom step, and a deck brush beside it
+    A.add(at(cyl(0.135, 0.108, 0.28, LOW() ? 8 : 16), 2.62, yC + 0.14, 7.35), M.plastic);
+    A.add(at(tor(0.136, 0.008, 5, LOW() ? 8 : 16), 2.62, yC + 0.275, 7.35, PI / 2), M.plastic);
+    A.add(at(cyl(0.015, 0.015, 0.95, LOW() ? 5 : 8), 2.92, yC + 0.50, 6.95, 0.30, 0, 0.08), M.powder);
+    A.add(at(box(0.08, 0.045, 0.22), 2.79, yC + 0.075, 7.10), M.plastic);
+    A.add(at(box(0.075, 0.045, 0.20), 2.79, yC + 0.038, 7.10), M.rubber);
+    // sunglasses and a mug on the cockpit table, because somebody sat here
+    A.add(at(cyl(0.038, 0.034, 0.095, LOW() ? 8 : 14), -0.42, yC + 0.665, 5.16), M.gelGrey);
+    A.add(at(tor(0.030, 0.007, 5, LOW() ? 6 : 12), -0.35, yC + 0.660, 5.16, 0, 0, PI / 2), M.gelGrey);
+    A.add(at(box(0.135, 0.012, 0.045), 0.36, yC + 0.618, 5.44, 0, 0.5, 0), M.plastic);
+    A.add(at(box(0.048, 0.010, 0.115), 0.30, yC + 0.618, 5.51, 0, 0.5, 0.2), M.plastic);
   }
 
   function buildCockpit(A, root, P) {
@@ -2104,10 +3599,10 @@
       gasket(A, s * 2.95, cT + 0.008, 6.30, 0.055, 0.012);
       A.add(at(tor(0.05, 0.016, 8, 16), s * 2.80, cT + 0.08, 3.55, 0, PI / 2, 0), M.steelSat);
     }
-    // sheet and halyard tails coiled on the coaming
+    // sheet and halyard tails, properly flaked down on the coaming
     for (s = -1; s <= 1; s += 2) {
-      A.add(at(tor(0.16, 0.011, 6, 18), s * 2.72, cT + 0.06, 4.55, PI / 2, 0, 0.2), M.sheet);
-      A.add(at(tor(0.14, 0.011, 6, 18), s * 2.72, cT + 0.08, 4.55, PI / 2, 0, -0.1), M.rope);
+      ropeCoil(A, s * 2.72, cT + 0.035, 4.55, 0.165, LOW() ? 3 : 5, M.sheet, 0.16 * s);
+      ropeCoil(A, s * 2.66, cT + 0.035, 6.05, 0.140, LOW() ? 3 : 4, M.rope, -0.11 * s);
       if (WR) WR.add([s * 2.80, cT + 0.05, 3.55], [s * 2.66, cT + 0.06, 4.05], 0.010, 0.01, 2);
     }
     // helm/companionway steps up to the flybridge, starboard side
@@ -2127,18 +3622,22 @@
     for (i = 0; i < spots.length; i++) {
       var sp = spots[i];
       gasket(A, sp[0], sp[1] + 0.006, sp[2], sp[3] * 1.50, 0.014);
-      A.add(at(cyl(sp[3] * 1.32, sp[3] * 1.42, 0.055, 18), sp[0], sp[1] + 0.038, sp[2]), M.steelSat);
+      /* The base pad is ANODISED BLACK, not satin stainless.  A bright drum
+         standing on a bright pad on a bright deck is one continuous value and
+         reads as a single turned lump; the dark casting is what separates the
+         moving part from the boat. */
+      A.add(at(cyl(sp[3] * 1.32, sp[3] * 1.42, 0.055, LOW() ? 12 : 26),
+               sp[0], sp[1] + 0.038, sp[2]), M.anod);
       var wg = new T.Group();
       wg.position.set(sp[0], sp[1] + 0.063, sp[2]);
       var wm = new T.Mesh(winchGeom(sp[3]), M.winch);
       wm.castShadow = true; wm.receiveShadow = true;
       wg.add(wm);
-      // three turns of sheet on the drum
-      var rw = new T.Mesh(mergeAll([
-        at(tor(sp[3] * 1.05, 0.012, 6, 20), 0, 0.055, 0, PI / 2),
-        at(tor(sp[3] * 1.05, 0.012, 6, 20), 0, 0.081, 0, PI / 2),
-        at(tor(sp[3] * 1.02, 0.012, 6, 20), 0, 0.107, 0, PI / 2)
-      ]), M.sheet);
+      var wd = new T.Mesh(winchDark(sp[3]), M.anod);
+      wd.castShadow = true; wd.receiveShadow = true;
+      wg.add(wd);
+      // three swept turns of sheet, climbing the throat
+      var rw = new T.Mesh(ropeWrap(sp[3]), M.sheet);
       rw.castShadow = true; rw.receiveShadow = true;
       wg.add(rw);
       root.add(wg);
@@ -2147,28 +3646,65 @@
         A.add(at(box(0.035, 0.035, 0.26), sp[0] + (sp[0] > 0 ? 0.26 : -0.26), sp[1] + 0.06, sp[2] + 0.22), M.plastic);
         A.add(at(cyl(0.022, 0.022, 0.10, 8), sp[0] + (sp[0] > 0 ? 0.26 : -0.26), sp[1] + 0.06, sp[2] + 0.36, PI / 2), M.rubber);
       }
+      /* THE TAIL.  A self-tailing winch with nothing in its jaws is a chrome
+         ornament: the rope leaving the crown, sagging across the coaming and
+         landing in its own flaked coil is what identifies the object as a
+         winch at a glance, and it is the only part of it with fibre in it. */
+      var sgn = sp[0] > 0 ? 1 : -1;
+      var jy = sp[1] + 0.063 + 0.262, jr = sp[3] * 0.92;
+      var tz = (i < 2) ? 4.55 : sp[2] + 0.62;
+      var ty = (i < 2) ? cT + 0.075 : sp[1] + 0.055;
+      var tx = (i < 2) ? sgn * 2.72 : sp[0] + sgn * 0.16;
+      var NTail = LOW() ? 4 : 8, kq;
+      for (kq = 0; kq < NTail; kq++) {
+        var u0 = kq / NTail, u1 = (kq + 1) / NTail;
+        var pA = [lerp(sp[0] + sgn * jr, tx, u0), lerp(jy, ty, u0) - 0.11 * Math.sin(u0 * PI),
+                  lerp(sp[2] + jr * 0.35, tz, u0)];
+        var pB = [lerp(sp[0] + sgn * jr, tx, u1), lerp(jy, ty, u1) - 0.11 * Math.sin(u1 * PI),
+                  lerp(sp[2] + jr * 0.35, tz, u1)];
+        A.add(at(rod(pA, pB, 0.0115, LOW() ? 4 : 7), 0, 0, 0), M.sheet);
+      }
     }
   }
 
   function buildFlybridge(A, root, P) {
     var s, i;
+    /* Everything from here to the end of the console is on M.gelIn — the same
+       gelcoat, bound to the box-projected cockpit probe.  These are the
+       surfaces the eye spends the whole shot on and the only ones close enough
+       to the probe for parallax to matter. */
     teakDeck(A, 6.00, 4.80, 0, S.yFly, 0.55, 0.06);
-    A.add(at(box(6.20, 0.16, 5.00), 0, S.yFly - 0.13, 0.55), M.gel);
+    A.add(at(box(6.20, 0.16, 5.00), 0, S.yFly - 0.13, 0.55), M.gelIn);
     for (s = -1; s <= 1; s += 2) {
-      A.add(at(box(0.14, 0.76, 5.00), s * 3.03, S.yFly + 0.38, 0.55), M.gel);
-      teakCap(A, 0.24, 5.00, s * 3.03, S.yFly + 0.80, 0.55, 0.06);
+      A.add(at(box(0.14, 0.76, 5.00), s * 3.03, S.yFly + 0.38, 0.55), M.gelIn);
+      teakCap(A, 0.24, 5.00, s * 3.03, S.yFly + 0.80, 0.55, 0.06, M.gelIn);
     }
-    A.add(at(box(6.20, 0.76, 0.14), 0, S.yFly + 0.38, 3.05), M.gel);
+    A.add(at(box(6.20, 0.76, 0.14), 0, S.yFly + 0.38, 3.05), M.gelIn);
     /* The inboard face of each coaming is 5 m of blank moulding that fills a
        third of the helm frame.  A real one carries a run of locker lids with
        6 mm parting lines, flush pulls, and a moulded reveal at half height —
        details that are worth more than any amount of shader work because
        they give the eye a rhythm to read the surface by. */
+    /* CONTACT FILLETS.  A moulded coaming does not meet the sole at a knife
+       edge — there is a 12 mm cove of laminate and a bead of sealant in it,
+       and that dark line is the cheapest possible statement that the two
+       surfaces are one moulding rather than two boxes pushed together.  The
+       winch bases already had this and were the best-looking detail on the
+       boat; the coaming-to-sole join, which is four metres long and runs
+       straight through the middle of the helm frame, had nothing. */
+    for (s = -1; s <= 1; s += 2) {
+      A.add(at(cyl(0.016, 0.016, 4.94, LOW() ? 4 : 8),
+               s * 2.955, S.yFly + 0.013, 0.55, PI / 2), M.gasket);
+      A.add(at(cyl(0.026, 0.026, 4.94, LOW() ? 4 : 8),
+               s * 2.984, S.yFly + 0.030, 0.55, PI / 2), M.gelIn);
+    }
+    A.add(at(cyl(0.016, 0.016, 5.90, LOW() ? 4 : 8),
+             0, S.yFly + 0.013, 2.965, 0, 0, PI / 2), M.gasket);
     for (s = -1; s <= 1; s += 2) {
       A.add(at(box(0.012, 0.030, 4.60), s * 2.945, S.yFly + 0.30, 0.55), M.gasket);
       for (i = 0; i < 4; i++) {
         var lz = -1.40 + i * 1.15;
-        A.add(at(box(0.026, 0.44, 1.02), s * 2.945, S.yFly + 0.54, lz), M.gel);
+        A.add(at(box(0.026, 0.44, 1.02), s * 2.945, S.yFly + 0.54, lz), M.gelIn);
         A.add(at(box(0.010, 0.48, 0.010), s * 2.930, S.yFly + 0.54, lz - 0.53), M.gasket);
         A.add(at(box(0.010, 0.48, 0.010), s * 2.930, S.yFly + 0.54, lz + 0.53), M.gasket);
         A.add(at(cyl(0.028, 0.028, 0.014, LOW() ? 8 : 22),
@@ -2194,13 +3730,13 @@
                -1.30, S.yFly + 0.016, hzz + 0.22, PI / 2), M.steelSat);
     }
     A.add(at(panelXY(5.90, 0.62, 1, 1), 0, S.yFly + 0.42, -1.90, -0.16), M.glass);
-    A.add(at(box(6.00, 0.62, 0.10), 0, S.yFly + 0.30, -1.96, -0.16), M.gel);
+    A.add(at(box(6.00, 0.62, 0.10), 0, S.yFly + 0.30, -1.96, -0.16), M.gelIn);
     // sunbed / L-settee to port
-    A.add(at(box(2.60, 0.44, 1.80), -1.55, S.yFly + 0.22, 1.90), M.gel);
+    A.add(at(box(2.60, 0.44, 1.80), -1.55, S.yFly + 0.22, 1.90), M.gelIn);
     A.add(at(cush(2.50, 0.14, 1.72), -1.55, S.yFly + 0.51, 1.90), M.cushion);
     A.add(at(cush(2.50, 0.42, 0.14), -1.55, S.yFly + 0.70, 2.80), M.cushion);
     // helm seat to starboard
-    A.add(at(box(1.30, 0.42, 0.58), 1.90, S.yFly + 0.21, -0.10), M.gel);
+    A.add(at(box(1.30, 0.42, 0.58), 1.90, S.yFly + 0.21, -0.10), M.gelIn);
     A.add(at(cush(1.24, 0.14, 0.54), 1.90, S.yFly + 0.49, -0.10), M.cushion);
     A.add(at(cush(1.24, 0.52, 0.14), 1.90, S.yFly + 0.72, 0.16), M.cushion);
     A.add(at(cyl(0.06, 0.06, 0.30, 10), 1.90, S.yFly + 0.15, -0.10), M.steel);
@@ -2223,7 +3759,7 @@
        sun separate the top from the face — a single box cannot. */
     A.add(at(box(1.70, 0.30, 0.52), hx, hy + 0.16, hz - 0.44), M.gelGrey);   // plinth
     A.add(at(box(1.74, 0.015, 0.55), hx, hy + 0.315, hz - 0.44), M.gasket);  // shadow gap
-    A.add(at(box(1.70, 0.40, 0.52), hx, hy + 0.545, hz - 0.44), M.gel);      // locker face
+    A.add(at(box(1.70, 0.40, 0.52), hx, hy + 0.545, hz - 0.44), M.gelIn);    // locker face
     for (i = 0; i < 2; i++) {                                   // locker lid parting lines
       A.add(at(box(0.008, 0.36, 0.53), hx - 0.28 + i * 0.56, hy + 0.545, hz - 0.44), M.gasket);
     }
@@ -2231,7 +3767,7 @@
       A.add(at(cyl(0.026, 0.026, 0.010, LOW() ? 10 : 24),
                hx - 0.56 + i * 0.56, hy + 0.545, hz - 0.185, PI / 2), M.steelSat);
     }
-    A.add(at(box(1.76, 0.055, 0.56), hx, hy + 0.772, hz - 0.44), M.gel);     // capping
+    A.add(at(box(1.76, 0.055, 0.56), hx, hy + 0.772, hz - 0.44), M.gelIn);   // capping
     /* Radiused edges.  A moulded gelcoat box has a 20 mm corner radius on
        every arris, and that radius is what carries the long blown specular
        line that tells you the surface is glossy.  Square-cut boxes cannot
@@ -2240,11 +3776,11 @@
     var NE = LOW() ? 6 : 14;
     for (i = -1; i <= 1; i += 2) {                       // vertical corners
       for (s = -1; s <= 1; s += 2) {
-        A.add(at(cyl(0.020, 0.020, 0.70, NE), hx + i * 0.85, hy + 0.545, hz - 0.44 + s * 0.26), M.gel);
+        A.add(at(cyl(0.020, 0.020, 0.70, NE), hx + i * 0.85, hy + 0.545, hz - 0.44 + s * 0.26), M.gelIn);
       }
     }
-    A.add(at(cyl(0.022, 0.022, 1.70, NE), hx, hy + 0.772, hz - 0.72, 0, 0, PI / 2), M.gel);
-    A.add(at(cyl(0.022, 0.022, 1.70, NE), hx, hy + 0.772, hz - 0.16, 0, 0, PI / 2), M.gel);
+    A.add(at(cyl(0.022, 0.022, 1.70, NE), hx, hy + 0.772, hz - 0.72, 0, 0, PI / 2), M.gelIn);
+    A.add(at(cyl(0.022, 0.022, 1.70, NE), hx, hy + 0.772, hz - 0.16, 0, 0, PI / 2), M.gelIn);
     A.add(at(rod([hx - 0.74, hy + 0.83, hz - 0.185], [hx + 0.74, hy + 0.83, hz - 0.185],
                  0.014, LOW() ? 6 : 12), 0, 0, 0), M.steel);                 // fiddle rail
     for (i = 0; i < 2; i++) {
@@ -2252,7 +3788,7 @@
                hx - 0.60 + i * 1.20, hy + 0.805, hz - 0.185), M.steel);
     }
     // dark low-glare dash field, set into a white surround
-    A.add(at(box(1.76, 0.05, 0.50), hx, dcy - 0.008, dcz, DT), M.gel);
+    A.add(at(box(1.76, 0.05, 0.50), hx, dcy - 0.008, dcz, DT), M.gelIn);
     A.add(at(box(1.62, 0.05, 0.40), hx, dcy + 0.004, dcz, DT), M.dash);
     // moulded brow over the dash: keeps the sun off the screens and, more to
     // the point, throws a hard shadow line across the instruments
@@ -2325,7 +3861,7 @@
        error under a tenth of a pixel at arm's length.  A visibly polygonal
        circle in the foreground is an instant CG tell that no shading fixes. */
     var R = 0.50, NR = LOW() ? 36 : 88, NT2 = LOW() ? 10 : 20;
-    var wa = [], la = [];
+    var wa = [], la = [], ka = [];
     la.push(at(tor(R, 0.028, NT2, NR), 0, 0, 0));
     wa.push(at(cyl(0.065, 0.065, 0.09, LOW() ? 14 : 36), 0, 0, 0, PI / 2));
     wa.push(at(cyl(0.030, 0.030, 0.14, LOW() ? 10 : 24), 0, 0, 0, PI / 2));
@@ -2337,19 +3873,60 @@
     }
     for (i = 0; i < 6; i++) {
       var a = i * PI / 3 + PI / 2;
+      var ca = Math.cos(a), sa2 = Math.sin(a);
       wa.push(at(cyl(0.011, 0.016, R - 0.050, LOW() ? 8 : 16),
-                 Math.cos(a) * (R - 0.02) / 2, Math.sin(a) * (R - 0.02) / 2, 0,
+                 ca * (R - 0.02) / 2, sa2 * (R - 0.02) / 2, 0,
                  0, 0, a - PI / 2));
-      wa.push(at(sph(0.028, LOW() ? 10 : 24, LOW() ? 8 : 16),
-                 Math.cos(a) * (R - 0.02), Math.sin(a) * (R - 0.02), 0.028));
+      /* JUNCTION.  The spoke used to disappear into the rim with nothing
+         marking where one part ends and the other begins, which is exactly
+         what makes an assembly read as a single moulding.  A real destroyer
+         wheel carries a machined ferrule swaged over the spoke end and a
+         clamp band round the rim at each root, and the leather wrap is cut
+         and finished against that band.  Two turned parts, and the whole
+         wheel starts reading as fabricated rather than extruded. */
+      wa.push(at(cyl(0.0205, 0.0165, 0.055, LOW() ? 8 : 20),
+                 ca * (R - 0.062), sa2 * (R - 0.062), 0, 0, 0, a - PI / 2));
+      /* Both junction parts are turned rings, and both are placed with a
+         cylinder rather than a torus: a cylinder's axis is +Y, so a single
+         rz rotation aims it, which is the same convention the spokes use and
+         cannot be got wrong.  The ferrule is coaxial with the SPOKE; the
+         clamp band encircles the rim tube, which runs tangentially, so its
+         axis is one quarter turn on from the spoke. */
+      wa.push(at(cyl(0.0225, 0.0225, 0.012, LOW() ? 8 : 20),
+                 ca * (R - 0.040), sa2 * (R - 0.040), 0, 0, 0, a - PI / 2));
+      /* Clamp band over the wrap.  Only 1.8 mm proud and 30 mm wide: the band
+         is viewed almost along its own axis from the helm, so anything that
+         stands further out shows its flat end cap and reads as a grey plate
+         pasted on the rim rather than as a collar round it. */
+      wa.push(at(cyl(0.0298, 0.0298, 0.030, LOW() ? 8 : 22),
+                 ca * R, sa2 * R, 0, 0, 0, a));
+      /* The knob is a POLISHED TURNED BALL, so it goes on the mapless chrome
+         material, not on the drawn-tube stainless: a streak map wrapped round
+         a sphere is what produced the mottled lava-marble the review picked
+         out as the single most conspicuously wrong material in the frame. */
+      ka.push(at(sph(0.028, LOW() ? 12 : 32, LOW() ? 10 : 24),
+                 ca * (R - 0.02), sa2 * (R - 0.02), 0.030));
+      // the knob is spigoted into the rim, not floating against it
+      ka.push(at(cyl(0.013, 0.017, 0.020, LOW() ? 8 : 16),
+                 ca * (R - 0.02), sa2 * (R - 0.02), 0.012, PI / 2));
     }
-    // king-spoke marker: how you read the helm angle at a glance
-    wa.push(at(box(0.05, 0.09, 0.05), 0, R, 0));
+    /* King-spoke marker: how you read the helm angle at a glance.  It was a
+       raw 50 x 90 x 50 box standing proud of the rim at top dead centre — a
+       flat grey slab sitting directly behind the nearest knob in the golden
+       frame, and the most debug-primitive-looking object left on the wheel.
+       A real one is a turned collar clamped round the rim with a short raised
+       finger on it, which is both correct and reads as a machined part from
+       any angle instead of only from dead ahead. */
+    wa.push(at(cyl(0.0345, 0.0345, 0.052, LOW() ? 8 : 24), 0, R, 0, 0, 0, PI / 2));
+    wa.push(at(cyl(0.0392, 0.0392, 0.010, LOW() ? 8 : 24), 0, R, 0, 0, 0, PI / 2));
+    wa.push(at(cyl(0.0075, 0.0090, 0.030, LOW() ? 6 : 14), 0, R + 0.040, 0));
+    wa.push(at(sph(0.0105, LOW() ? 8 : 16, LOW() ? 6 : 12), 0, R + 0.055, 0));
     var wm1 = new T.Mesh(mergeAll(wa), M.steel);
     var wm2 = new T.Mesh(mergeAll(la), M.leather);
-    wm1.castShadow = wm2.castShadow = true;
-    wm1.receiveShadow = wm2.receiveShadow = true;
-    wheel.add(wm1); wheel.add(wm2);
+    var wm3 = new T.Mesh(mergeAll(ka), M.chrome);
+    wm1.castShadow = wm2.castShadow = wm3.castShadow = true;
+    wm1.receiveShadow = wm2.receiveShadow = wm3.receiveShadow = true;
+    wheel.add(wm1); wheel.add(wm2); wheel.add(wm3);
     P.wheel = wheel;
 
     /* First-person eye points, rigidly attached to the boat.  1.62 m above
@@ -2772,7 +4349,16 @@
        hardtop, which is itself brightly uplit by the water.  Both paths are
        invisible to a single hemisphere light once baked occlusion has scaled
        it down, and leaving them out is what buries a laid teak deck in ink. */
-    var u = skyE * 0.34 + sunE * up * 0.045 + hE * 0.048;
+    /* Raised ~45% together with the lateral term below.  An INTERIOR cube
+       probe is a one-bounce estimate of a space whose walls are lit mostly by
+       each other, so it systematically loses energy — the probe sees a dark
+       cockpit, the cockpit therefore receives less indirect, and the next
+       probe is darker still.  Measured on the first build with the new probes
+       the shaded flybridge fell to RGB 36/25/21 with 38% of its pixels
+       crushed.  The analytic bounce is the term that has to break that loop,
+       because unlike the probe it is computed from the sky and sun energies
+       directly and cannot feed back. */
+    var u = skyE * 0.72 + sunE * up * 0.086 + hE * 0.125;
     var uhr = lerp(kr, hr, 0.45), uhg = lerp(kg, hg, 0.45), uhb = lerp(kb, hb, 0.45);
     UNI.uBounceUp.value.set(
       u * (0.60 + 0.40 * uhr) * (0.72 + 0.28 * sr),
@@ -2785,11 +4371,57 @@
        diffusely scattered sunlight plus glitter.  Weighted so that at noon the
        cockpit lands about two and a half stops under the open water, which is
        what a photograph of a hardtop cockpit actually measures. */
-    var side = hE * 0.078 + (sunE * up * 0.055 + skyE * 0.20) * 0.5;
+    /* Raised ~35%.  Measured on the shipped build the shadowed cockpit around
+       the pedestal averaged RGB 37/28/24 with 6.6% of its pixels at near-black
+       and no detail in them.  An open cockpit at golden hour is filled by a
+       whole sky dome plus a fully lit orange sea; clipping it to zero is a
+       bounce-light failure, and it destroyed the geometry read across the
+       lower third of the frame. */
+    var side = hE * 0.225 + (sunE * up * 0.150 + skyE * 0.58) * 0.5;
     UNI.uBounceSide.value.set(
       side * (0.72 + 0.28 * lerp(hr, sr, 0.5)),
       side * (0.80 + 0.22 * lerp(hg, sg, 0.5)),
       side * (0.86 + 0.20 * lerp(hb, sb, 0.5)));
+
+    /* ---- the warm half of the hemisphere -----------------------------------
+       Everything above is azimuthally flat: it gives a surface facing into a
+       burning western sky exactly the same fill as the one facing the cold
+       eastern half, which is why a two-light rig always reads as composited.
+       This is the DELTA that only the sunward half receives — the low-sun
+       horizon glow plus the glitter path off the sea — and it is weighted so
+       it is nearly nothing at noon (where the sky really is close to
+       azimuthally uniform in a hemisphere sense) and large and amber at 17:45.
+       It is what finally puts orange on the underside of the hardtop and on
+       the inboard face of the coaming instead of neutral grey. */
+    var lowSun = 1.0 - clamp((sunY - 0.03) / 0.55, 0, 1);   // 0 at noon, 1 at sunset
+    var warm = (hE * 0.30 + sunE * up * 0.10) * (0.16 + 0.84 * lowSun * lowSun);
+    UNI.uBounceWarm.value.set(
+      warm * (0.55 + 0.65 * lerp(hr, sr, 0.55)),
+      warm * (0.34 + 0.52 * lerp(hg, sg, 0.55)),
+      warm * (0.16 + 0.34 * lerp(hb, sb, 0.55)));
+    // world-space sun for the azimuth split and for the rim term
+    if (sd && isNum(sd.x)) UNI.uSunW.value.set(sd.x, sd.y, sd.z).normalize();
+    else UNI.uSunW.value.set(0.3, 0.9, -0.3).normalize();
+
+    /* ---- analytic sun lobe -------------------------------------------------
+       View-space sun direction and radiance for the punctual specular term in
+       patchMat.  The radiance is deliberately NOT sunE: sunE is the full
+       irradiance the diffuse path wants, whereas this lobe is a narrow
+       specular one whose job is to CLIP on gloss and fall off fast, so it is
+       driven from the sun colour at a fraction that lands a polished tube at
+       1.0 in direct noon sun and leaves a roughness-0.5 moulding untouched. */
+    var camS = SAIL.camera;
+    if (camS && camS.isPerspectiveCamera && sd) {
+      _sv.set(sd.x, sd.y, sd.z).transformDirection(camS.matrixWorldInverse);
+      UNI.uSunV.value.copy(_sv);
+    } else {
+      UNI.uSunV.value.set(0.30, 0.90, -0.30);
+    }
+    /* Fade out as the sun sets — below the horizon there is no disk to glint
+       off, and holding it would light the boat from under the sea. */
+    var gk = clamp((sunY - 0.005) / 0.06, 0, 1);
+    var gE = sunE * 0.030 * gk;
+    UNI.uSunRad.value.set(gE * sr, gE * sg, gE * sb);
 
     // ---- analytic wires ---------------------------------------------------
     if (!MWS) return;
@@ -2847,6 +4479,7 @@
         buildFlybridge(A, root, P);
         buildRig(A, root, P);
         buildForedeck(A, root, P);
+        buildClutter(A, root, P);
         A.flush(root, 'hull');
         buildLights(A, root, P);
         buildEnsign(root, P);
@@ -2864,9 +4497,29 @@
         if (P.boomJacks) P.boomJacks.__noAO = true;
       } catch (e) { }
       try { bakeOcclusion(root, wireList); } catch (e) { }
+      /* Every solid surface on the boat receives. 37 of the 85 meshes were
+         being missed — the hand-built ones (lamp bodies, ensign, staff, the
+         merged 'extra' pass) — and a deck fitting that does not receive
+         cannot be sat in the shadow of the thing standing next to it, which
+         is most of what "no contact shadows in the cockpit" was. Casting is
+         left exactly as each builder set it: the wire ribbons are camera-
+         facing analytic ribbons and would cast a false slab, and the ensign
+         is a two-sided plane that self-shadows into stripes. */
+      try {
+        root.traverse(function (o) {
+          if (!o.isMesh || o.isSprite) return;
+          var mm = o.material;
+          if (mm && mm.isShaderMaterial && !mm.isRawShaderMaterial && !mm.lights) {
+            // bare ShaderMaterial: three emits no shadow chunks, the flag is
+            // inert, and leaving it set only wastes a per-object uniform test
+            o.receiveShadow = false; return;
+          }
+          o.receiveShadow = true;
+        });
+      } catch (e) { }
       try { probeInit(root); } catch (e) { }
       try { updateLighting(); } catch (e) { }
-      _envSeen = null; syncEnv();
+      _envSeen[0] = _envSeen[1] = null; syncEnv();
       if (scene && scene.add) scene.add(root);
       var inst = { group: root, parts: P };
       API.group = root;
@@ -2893,7 +4546,7 @@
     },
 
     /* Rebuild materials against a new env map / quality setting. */
-    refresh: function () { _envSeen = null; syncEnv(); },
+    refresh: function () { _envSeen[0] = _envSeen[1] = null; syncEnv(); },
 
     /* Exposed for tuning and for other modules that want to know how much
        uplight the boat is receiving (the sails want the same term). */
@@ -2912,7 +4565,10 @@
          gelcoat responding to the sun's colour, so it runs every frame. */
       try { updateLighting(); } catch (e) { }
       try { probeUpdate(dt); } catch (e) { }
-      if (!inst._envT || t - inst._envT > 0.45) { inst._envT = t; syncEnv(); }
+      /* syncEnv is two reference comparisons in the common case, so there is
+         nothing to throttle: throttling it only delayed the moment a finished
+         probe reached the materials. */
+      try { syncEnv(); } catch (e) { }
 
       /* -- rigid-body placement (idempotent if app.js also sets it) ------- */
       if (isNum(st.x) && isNum(st.z)) {

@@ -13,13 +13,45 @@
    evaluation or a PMREM cubeUV lookup.  skyRadiance(dir,sunDir) is published
    as GLSL for the ocean / terrain / cloud shaders to share.
 
-   Clouds are a true 40-step raymarch through a spherical slab (900..2400 m)
-   rendered into a panoramic 384x192 RGBA16F LUT, amortised over 3 frames in
-   horizontal bands.  Density comes from one procedurally generated 512^2
-   noise atlas sampled with height-dependent shear, which gives cumulus towers
-   for the cost of 2D fetches.  Lighting: 5-step light march, 3-octave
-   multiple-scattering approximation, dual-lobe HG (silver lining), Beer's-law
-   powder term, sky ambient and full aerial perspective.
+   Clouds are an adaptive raymarch through a spherical slab (690..2620 m) with
+   half-step boundary refinement, run twice: into a 2048x1024 panoramic RGBA16F
+   LUT (reflections / PMREM / aerial perspective, amortised over 16 horizontal
+   bands) and into a 0.68x screen-space buffer with temporal reprojection,
+   which is what the visible dome shows.  The panorama resolution is a
+   CORRECTNESS constraint, not a quality dial: at 768x384 one texel spans 0.469
+   deg, which over a 92 deg field on an 1800 px frame is 9.2 screen pixels, and
+   every cloud that path serves arrives as nearest-neighbour blocks with no
+   silhouette left in it.  2048x1024 is 0.176 deg/texel and it is fetched with
+   a 4-tap Catmull-Rom (sailCloudTap) because a C0 bilinear kernel at any
+   magnification puts its gradient discontinuities on an axis-aligned lattice.
+
+   Density is a Worley CELL field — discrete trade-wind cumulus with real blue
+   sky between them, ~20-25% cover — times a 5-13 km cloud-street modulator,
+   gated by a hard 22 m per-cell condensation level so every cloud has one
+   razor-flat base, with per-cell tops spread 0.80-1.24x so no population of
+   cells shares a ceiling.  The volume fetches are C1 on all three axes
+   (smoothstep-warped texel coordinates), which keeps the silhouettes free of
+   the axis-aligned staircases and stacked-lenticular seams that a raw bilinear
+   tap produces at 20x magnification.
+
+   Lighting is a 6-tap coned sun march to ~2.4 km PLUS an analytic column term
+   (clLight): the march alone is a noisy estimator of a quantity that must be
+   MONOTONE in height, and a noisy estimator is how two consecutive builds
+   shipped cumulus whose undersides were measurably brighter and warmer than
+   their sun-facing crowns.  The analytic term adds the geometric depth of the
+   cell above the sample, gated on the march having actually found cloud in the
+   first 250 m so it never fires on an exposed turret cap.  On top of that:
+   three Wrenninge multiple-scatter octaves, dual-lobe HG (silver lining), a
+   powder term that only ever darkens, and a TWO-LOBE sky ambient — the crown
+   sees the sky hemisphere, the base sees a 6%-albedo sea and its own shadow —
+   which together put a sunlit cauliflower 4.5 stops (scene-referred) over a
+   grey-blue base.  S.selfTest() asserts that ratio on every build.
+
+   Sun-ray transmittance of the deck is exported as a 1024^2 shadow plane over
+   9 km (8.8 m/texel, one band of 12 per frame) for the ocean, island and
+   sails: sailCloudShadow(worldPos).  Consumers should sample THIS rather than
+   rolling an independent wind-advected noise field, or the dark patches on the
+   water will sit under clear sky.
 
    World axes:  +X = East, +Z = South, -Z = North, Y = up, metres.
 
@@ -75,18 +107,38 @@
      Rayleigh blue and green to saturation and whitens the band all by itself.
      So: clean air, forward-peaked (uMieG 0.82), and the circumsolar
      brightening handled by the explicit aureole instead. */
-  var BETA_M = 5.0e-3;                                   // Mie scattering
+  /* Dropped from 5.0e-3.  Aerosol scattering is GREY, and grey is exactly what
+     turned the golden-hour mid-band achromatic (measured 9% chroma, R~G~B).
+     A clean tropical marine airmass really is this thin above the boundary
+     layer; the bright horizon band is carried by the 0.45 km marine slab in
+     atmDM(), which is unaffected. */
+  var BETA_M = 3.4e-3;                                   // Mie scattering
   var BETA_M_E = BETA_M / 0.9;                           // Mie extinction
   /* Ozone Chappuis absorption.  This is the band that eats yellow-green and
      leaves the upper sky blue-violet while the horizon burns orange — without
      enough of it a sunset crosses from blue to gold through a dead neutral
-     grey, which is the fingerprint of an sRGB lerp and reads as broken. */
-  var BETA_O = [0.900e-3, 2.450e-3, 0.095e-3];           // ozone absorption
+     grey, which is the fingerprint of an sRGB lerp and reads as broken.
+     Raised ~1.5x (tropical column runs high, ~290-310 DU, and the Chappuis
+     path length at low sun is enormous) AND re-weighted toward RED.  This is a
+     three-band FIT, not a spectral integral: the part of the Chappuis band that
+     actually turns a low sky cyan sits at 590-620 nm, which straddles the R and
+     G primaries, so a naive per-primary cross-section absorbs green hardest and
+     drives the mid-band toward neutral — precisely the dead grey waypoint the
+     review measured at 9% chroma.  Loading the red channel instead makes the
+     crossover between the blue upper sky and the warm horizon pass through
+     TEAL, which is what a real tropical evening does. */
+  /* Green raised 3.00 -> 4.35e-3.  The zenith measured sRGB G/B 0.68 where the
+     reference wants 0.62-0.65, and the only spectrally honest lever that pulls
+     GREEN down without touching blue is the Chappuis band — it is centred at
+     600 nm but its shoulder runs well into the 550 nm primary.  Everything else
+     that could darken green (more Rayleigh, less Mie) darkens blue harder and
+     just makes the sky dimmer rather than more saturated. */
+  var BETA_O = [2.250e-3, 4.350e-3, 0.140e-3];           // ozone absorption
   // vertical optical depth of the whole column, split by species so the CPU
   // radiometry can attenuate each with its own altitude profile
   var TAU_R = [0.04370, 0.10300, 0.26700];   // Rayleigh   (H = 8.0 km)
-  var TAU_A = [0.02125, 0.02292, 0.02498];   // aerosol    (1.2 km + marine 0.45 km)
-  var TAU_O = [0.01350, 0.03675, 0.00143];   // ozone      (tent, 10..40 km)
+  var TAU_A = [0.01446, 0.01570, 0.01699];   // aerosol    (1.2 km + marine 0.36 km)
+  var TAU_O = [0.03380, 0.06500, 0.00210];   // ozone      (tent, 10..40 km)
   var TAU_V = [TAU_R[0] + TAU_A[0] + TAU_O[0],
                TAU_R[1] + TAU_A[1] + TAU_O[1],
                TAU_R[2] + TAU_A[2] + TAU_O[2]];
@@ -98,11 +150,15 @@
      255 and dumps a large amount of energy into the bloom bright-pass. */
   var SUN_DISC_L = 2.2e4;
   /* trade-wind cumulus: one flat condensation base, tops well up in the slab */
-  var CL_BASE = 700.0, CL_TOP = 2300.0;
+  var CL_BASE = 690.0, CL_TOP = 2620.0;
 
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
   function smoothstepf(a, b, x) { var t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
   function lum3(c) { return LUM[0] * c[0] + LUM[1] * c[1] + LUM[2] * c[2]; }
+  function hgF(c, g) {
+    var g2 = g * g, d = 1 + g2 - 2 * g * c;
+    return (1 - g2) / (4 * PI * Math.max(d * Math.sqrt(Math.max(d, 1e-4)), 1e-4));
+  }
 
   /* ------------------------------------------------- shared uniform objects
      One object per uniform, shared by reference with every material that
@@ -113,7 +169,7 @@
     uSkyTransLUT:   { value: null },
     uSkyTransSize:  { value: new THREE.Vector2(256, 64) },
     uSkyCloudLUT:   { value: null },
-    uSkyCloudSize:  { value: new THREE.Vector2(384, 192) },
+    uSkyCloudSize:  { value: new THREE.Vector2(2048, 1024) },
     uSkySunDir:     { value: new THREE.Vector3(0.3, 0.9, -0.3) },
     uSkyMoonDir:    { value: new THREE.Vector3(0, -1, 0) },
     uSkySunTint:    { value: new THREE.Vector3(1, 0.93, 0.82) },
@@ -129,7 +185,12 @@
     uSkyBetaMe:     { value: BETA_M_E * 1e-3 },
     uSkyAerialGain: { value: 1.0 },
     uSkyCloudMix:   { value: 1.0 },
-    uSkyExposure:   { value: 0.030 }
+    uSkyExposure:   { value: 0.030 },
+    /* Cloud shadow projection, exported for the shadow pass.  uSkyCloudShTex
+       stores the sun-ray transmittance of the cloud deck sampled on the y = 0
+       plane; xy = world origin of the map, z = 1/span, w = strength.        */
+    uSkyCloudShTex: { value: null },
+    uSkyCloudShBox: { value: new THREE.Vector4(-6000, -6000, 1 / 12000, 0.0) }
   };
   var registered = [];
 
@@ -166,6 +227,7 @@
     'uniform sampler2D uSkyLUT;      uniform vec2 uSkyLutSize;',
     'uniform sampler2D uSkyTransLUT; uniform vec2 uSkyTransSize;',
     'uniform sampler2D uSkyCloudLUT; uniform vec2 uSkyCloudSize;',
+    'uniform sampler2D uSkyCloudShTex; uniform vec4 uSkyCloudShBox;',
     'uniform vec3 uSkySunDir, uSkyMoonDir, uSkySunTint, uSkyBetaR;',
     'uniform float uSkySunE, uSkySkyE, uSkyMoonE, uSkyMoonFrac, uSkyNight, uSkyTime;',
     'uniform float uSkyLutScale, uSkyBetaMe, uSkyAerialGain, uSkyCloudMix, uSkyExposure;',
@@ -234,14 +296,55 @@
     '   itself prefers the screen-space march (see the dome shader).  The fade',
     '   only exists to stop the bilinear tap reaching below the first texel row —',
     '   clouds must survive all the way down to the geometric horizon.        */',
+    '/* CATMULL-ROM, NOT BILINEAR.  Even at 2048x1024 the panorama is 0.176 deg',
+    '   per texel against a 0.05 deg pixel, so the reconstruction filter IS the',
+    '   cloud silhouette at anything past the screen march.  A bilinear tap is C0:',
+    '   the gradient jumps at every texel boundary and those jumps align into the',
+    '   axis-aligned square lattice the review called "pixel confetti".  A cubic',
+    '   B-spline/Catmull-Rom kernel is C1 and its 4 taps are bilinear-accelerated',
+    '   (Sigg-Hadwiger offsets), so this costs four fetches, not sixteen, and the',
+    '   blocks dissolve into smooth lobes instead of being feathered into mush.  */',
+    'vec4 sailCloudTap(vec2 uv){',
+    '  vec2 ts = uSkyCloudSize;',
+    '  vec2 p = uv*ts - 0.5;',
+    '  vec2 i = floor(p), f = p - i;',
+    '  vec2 f2 = f*f, f3 = f2*f;',
+    '  vec2 w0 = -0.5*f3 + f2 - 0.5*f;',
+    '  vec2 w1 =  1.5*f3 - 2.5*f2 + 1.0;',
+    '  vec2 w2 = -1.5*f3 + 2.0*f2 + 0.5*f;',
+    '  vec2 w3 =  0.5*f3 - 0.5*f2;',
+    '  vec2 s0 = w0 + w1, s1 = w2 + w3;',
+    '  vec2 o0 = (i - 1.0 + w1/max(s0, vec2(1e-5)) + 0.5)/ts;',
+    '  vec2 o1 = (i + 1.0 + w3/max(s1, vec2(1e-5)) + 0.5)/ts;',
+    '  float vlo = 0.5/ts.y, vhi = 1.0 - 0.5/ts.y;',
+    '  o0.y = clamp(o0.y, vlo, vhi); o1.y = clamp(o1.y, vlo, vhi);',
+    '  vec4 a = texture2D(uSkyCloudLUT, vec2(o0.x, o0.y))*(s0.x*s0.y)',
+    '         + texture2D(uSkyCloudLUT, vec2(o1.x, o0.y))*(s1.x*s0.y)',
+    '         + texture2D(uSkyCloudLUT, vec2(o0.x, o1.y))*(s0.x*s1.y)',
+    '         + texture2D(uSkyCloudLUT, vec2(o1.x, o1.y))*(s1.x*s1.y);',
+    '  return vec4(max(a.rgb, vec3(0.0)), clamp(a.a, 0.0, 1.0)); }',
     'vec4 sailCloudSample(vec3 dir){',
     '  float el = asin(clamp(dir.y,-1.0,1.0));',
     '  float v = sqrt(clamp(el/(0.5*SAIL_PI), 0.0, 1.0));',
     '  float u = atan(dir.x, -dir.z)/(2.0*SAIL_PI) + 0.5;',
     '  v = clamp(v, 0.5/uSkyCloudSize.y, 1.0-0.5/uSkyCloudSize.y);',
-    '  vec4 c = texture2D(uSkyCloudLUT, vec2(u,v));',
+    '  vec4 c = sailCloudTap(vec2(u,v));',
     '  float f = smoothstep(-0.0090, 0.0018, dir.y) * uSkyCloudMix;',
     '  return vec4(c.rgb*uSkyLutScale*f, mix(1.0, clamp(c.a,0.0,1.0), f)); }',
+    '',
+    '/* ---- cloud shadow (EXPORTED) ----------------------------------------- */',
+    '/* Sun-ray transmittance of the cloud deck, rendered on the y = 0 plane and',
+    '   re-projected along the sun ray for elevated receivers.  Any material that',
+    '   calls SAIL.sky.register() already has the uniforms; just call this.      */',
+    'float sailCloudShadow(vec3 wp){',
+    '  if (uSkyCloudShBox.w <= 0.001) return 1.0;',
+    '  float ly = max(uSkySunDir.y, 0.07);',
+    '  vec2 g = wp.xz - uSkySunDir.xz*(max(wp.y, 0.0)/ly);',
+    '  vec2 uv = (g - uSkyCloudShBox.xy)*uSkyCloudShBox.z;',
+    '  vec2 e = min(uv, 1.0-uv);',
+    '  float edge = smoothstep(0.0, 0.035, min(e.x, e.y));',
+    '  float s = texture2D(uSkyCloudShTex, clamp(uv, 0.002, 0.998)).r;',
+    '  return mix(1.0, mix(1.0, s, edge), uSkyCloudShBox.w); }',
     '',
     '/* ---- hash / value noise (declared before every consumer) -------------- */',
     'vec3 sailHash33(vec3 p){',
@@ -382,7 +485,7 @@
     'vec3 sailAerialTransmittance(vec3 wp, vec3 cp){',
     '  float dist = length(wp-cp);',
     '  float odR = sailPathDens(cp.y, wp.y, dist, 8000.0);',
-    '  float odM = sailPathDens(cp.y, wp.y, dist, 1200.0) + 6.5*sailPathDens(cp.y, wp.y, dist, 450.0);',
+    '  float odM = sailPathDens(cp.y, wp.y, dist, 1200.0) + 8.2*sailPathDens(cp.y, wp.y, dist, 360.0);',
     '  return exp(-(uSkyBetaR*odR + vec3(uSkyBetaMe*odM))*uSkyAerialGain); }',
     'vec3 aerialPerspective(vec3 col, vec3 wp, vec3 cp, vec3 sun){',
     '  vec3 d = wp-cp; float dist = length(d);',
@@ -410,6 +513,7 @@
   var renderer = null, scene = null;
   var quadScene = null, quadCam = null, quadMesh = null;
   var rtTrans = null, rtSky = null, rtCloud = null, rtNoise = null;
+  var rtShape = null, rtDet = null, rtShadow = null, matShadow = null;
   var matTrans = null, matSky = null, matCloud = null, matNoise = null, domeMat = null;
   var dome = null, envDome = null, envScene = null, pmrem = null, envRT = null;
   var hdrOK = true, lutType = THREE.HalfFloatType;
@@ -473,7 +577,15 @@
     'const float BME = ' + BETA_M_E + ';',
     'uniform float uHazeK;',
     'float atmDR(float h){ return exp(-max(h,0.0)/8.0); }',
-    'float atmDM(float h){ h = max(h,0.0); return exp(-h/1.2) + 6.5*uHazeK*exp(-h/0.45); }',
+    /* Marine slab: 6.5 x exp(-h/0.45) -> 8.2 x exp(-h/0.36).  Same total column
+       mass (2.925 vs 2.952 km-equivalent, so every CPU tau constant survives)
+       but packed into a 360 m layer instead of a 450 m one.  Airmass through an
+       exponential slab of scale height H goes as H/sin(elev), so squeezing H
+       makes the horizon brightening EXPONENTIAL in elevation rather than the
+       near-linear ramp the review measured: at 2 deg the ray carries 10 km of
+       slab, at 10 deg only 2 km, and the glow collapses into the bottom few
+       degrees where it belongs. */
+    'float atmDM(float h){ h = max(h,0.0); return exp(-h/1.2) + 8.2*uHazeK*exp(-h/0.36); }',
     'float atmDO(float h){ return max(0.0, 1.0 - abs(h-25.0)/15.0); }',
     'vec3 atmExt(float h){ return BR*atmDR(h) + vec3(BME*atmDM(h)) + BO*atmDO(h); }',
     'float atmTop(float r, float mu){',
@@ -530,7 +642,12 @@
         uTrans: { value: rtTrans.texture },
         uTransSize: { value: U.uSkyTransSize.value },
         uSunIrr: { value: new THREE.Vector3(178, 178, 178) },
-        uMS: { value: 0.92 },
+        /* 0.92 -> 0.74.  This term is the only GREY, near-isotropic source in
+           the model, so its weight IS the zenith desaturation knob and it is
+           also what spreads the golden-hour warmth uniformly round the compass.
+           Both review defects (zenith G/B 0.68 vs 0.62 target; azimuthally flat
+           cream band) trace to the same over-weighted fill. */
+        uMS: { value: 0.74 },
         uMieG: { value: 0.820 },
         uScale: { value: 1.0 },
         uHazeK: hazeK
@@ -611,16 +728,37 @@
         '       overwhelmingly Rayleigh (the aerosol is a thin low slab that most',
         '       photons never scatter off twice).  So: weight down hard, and keep',
         '       the Mie fraction token. */',
-        '    vec3 Tms = pow(max(Tl, vec3(1e-5)), vec3(0.44));',
-        '    float msPh = 0.72 + 0.28*(pr*4.0*ATM_PI/3.0);',
-        '    vec3 iso = (sR + sM*0.04)*(0.25/ATM_PI)*(Tms*shdM)*msPh;',
+        '    /* Exponent 0.44 -> 0.28.  At golden hour Tl is deeply reddened, so a',
+        '       high exponent poured RED into the multiply-scattered term and the',
+        '       anti-solar upper sky came out (91,119,159) — R/B 0.57, a smoggy',
+        '       lavender.  Multiply-scattered photons did not travel the reddened',
+        '       horizon path, so de-redden hard and leave the term Rayleigh-blue. */',
+        '    vec3 Tms = pow(max(Tl, vec3(1e-5)), vec3(0.22));',
+        '    /* THE MULTIPLE-SCATTER TERM MUST STAY DIRECTIONAL.  A flat 0.72',
+        '       pedestal made the fill isotropic, and at golden hour an isotropic',
+        '       fill paints the same cream value at the sun bearing and 180 deg',
+        '       off it — which is exactly the "warm band spans the full width at',
+        '       even intensity" failure.  Second-order photons in a real airmass',
+        '       still remember the forward lobe of the first scattering event, so',
+        '       carry a normalised HG(0.55) through: mean 1 over the sphere,',
+        '       ~7.6x at the sun bearing, ~0.19x at the antisolar point.  Net',
+        '       azimuthal contrast in this term is ~2.7x, and the horizon cools to',
+        '       neutral blue-grey by 90 deg off-sun.  Mie fraction 0.04 -> 0.015',
+        '       because the grey part of this term is what desaturates the zenith. */',
+        '    float msFwd = clamp(hg(nu, 0.55)*4.0*ATM_PI, 0.0, 24.0);',
+        '    float msPh = max(0.70 + 0.16*(pr*4.0*ATM_PI/3.0) + 0.145*(msFwd - 1.0), 0.30);',
+        '    vec3 iso = (sR + sM*0.015)*(0.25/ATM_PI)*(Tms*shdM)*msPh;',
         '    vec3 stepT = exp(-ext*dt);',
         '    L += T*((inS + iso*uMS)*(vec3(1.0)-stepT)/ext);',
         '    T *= stepT; }',
         '  if (ground){',
         '    float muS = dot(normalize(vec3(dir.x*tMax, r0+dir.y*tMax, dir.z*tMax)), uSun);',
         '    vec3 gT = trans(ATM_RG+0.0005, max(muS,0.0));',
-        '    L += T*(0.035/ATM_PI)*max(muS,0.0)*gT*vec3(0.55,0.75,1.0); }',
+        '    /* Sea bounce.  6% albedo, and BLUER than it was: a 0.55/0.75/1.0',
+        '       ground tint is nearly grey and it was lifting the green channel of',
+        '       every downward-looking ray, which the sky-view LUT then hands back',
+        '       to the ocean shader as reflected sky. */',
+        '    L += T*(0.017/ATM_PI)*max(muS,0.0)*gT*vec3(0.34,0.58,1.0); }',
         '  L *= uSunIrr;',
         '  L = max(L, vec3(0.0));',
         '  float lm = dot(L, vec3(0.3333)); if (!(lm < 1e5)) L = vec3(0.0);',
@@ -631,15 +769,71 @@
     U.uSkyLutSize.value.set(w, h);
   }
 
-  /* ------------------------------------------------------------ cloud noise */
+  /* ------------------------------------------------------------ cloud noise
+     THREE textures, all built once on the GPU:
+
+       rtNoise  256x256 RGBA8, RepeatWrapping — the WEATHER MAP.  Purely 2D and
+                purely synoptic: r = coverage, g = cloud type (pancake..tower),
+                b = condensation-level jitter, a = a second, larger coverage
+                scale so clusters cluster.
+
+       rtShape  520x520 RGBA8 — a TILEABLE 64^3 VOLUME packed as an 8x8 grid of
+                65x65 z-slices.  r = Perlin-Worley, gba = inverted-Worley fbm at
+                three rising frequencies.  This replaces the old 2D extrusion:
+                a 2D field translated with height is still invariant along a
+                fixed 3D direction, so every iso-surface was a RULED surface —
+                which is exactly why the old clouds read as prismatic blades.
+
+       rtDet    264x132 RGBA8 — a tileable 32^3 volume, 8x4 grid of 33x33
+                slices.  r = fine Worley fbm (the edge erosion), gba = a
+                normalised CURL vector used to warp the second erosion tap so
+                the bites come out wispy and swirled instead of cellular.
+
+     The 65th row/column of every tile DUPLICATES the 0th, so hardware bilinear
+     wraps exactly across the tile seam; only the z axis needs a manual lerp
+     (two taps).  That is what makes a 2D atlas behave like a wrapped 3D
+     texture without a single GLSL-version change.
+
+     NO MIPMAPS anywhere: every tap happens inside a raymarch where the screen
+     derivatives that drive LOD are meaningless.  Frequency control is done
+     explicitly, per octave, against the actual step length (see clDens).    */
+
+  var NOISE3 = [
+    'vec3 h33(vec3 p){',
+    '  p = vec3(dot(p,vec3(127.1,311.7,74.7)), dot(p,vec3(269.5,183.3,246.1)), dot(p,vec3(113.5,271.9,124.6)));',
+    '  return fract(sin(p+0.71)*43758.5453123); }',
+    'float h13(vec3 p){ return fract(sin(dot(p+0.37, vec3(127.1,311.7,74.7))+1.7)*43758.5453123); }',
+    'float vn3(vec3 p, float per){',
+    '  vec3 i = floor(p), f = fract(p); vec3 u = f*f*(3.0-2.0*f);',
+    '  float a=h13(mod(i,per)),               b=h13(mod(i+vec3(1.0,0.0,0.0),per));',
+    '  float c=h13(mod(i+vec3(0.0,1.0,0.0),per)), d=h13(mod(i+vec3(1.0,1.0,0.0),per));',
+    '  float e=h13(mod(i+vec3(0.0,0.0,1.0),per)), g=h13(mod(i+vec3(1.0,0.0,1.0),per));',
+    '  float k=h13(mod(i+vec3(0.0,1.0,1.0),per)), m=h13(mod(i+vec3(1.0,1.0,1.0),per));',
+    '  return mix(mix(mix(a,b,u.x),mix(c,d,u.x),u.y), mix(mix(e,g,u.x),mix(k,m,u.x),u.y), u.z); }',
+    'float fbm3(vec3 p, float per, int oct){',
+    '  float s=0.0, a=0.5, n=0.0;',
+    '  for (int i=0;i<6;i++){ if (i>=oct) break;',
+    '    s += a*vn3(p, per); n += a; p *= 2.0; per *= 2.0; a *= 0.5; }',
+    '  return s/max(n,1e-4); }',
+    'float wor3(vec3 p, float per){',
+    '  vec3 i = floor(p), f = fract(p); float m = 4.0;',
+    '  for (int z=-1;z<=1;z++) for (int y=-1;y<=1;y++) for (int x=-1;x<=1;x++){',
+    '    vec3 g = vec3(float(x), float(y), float(z));',
+    '    vec3 o = h33(mod(i+g, per));',
+    '    m = min(m, dot(g+o-f, g+o-f)); }',
+    '  return clamp(sqrt(m), 0.0, 1.0); }',
+    'float worFbm(vec3 p, float f0){',
+    '  float a = 1.0 - wor3(p*f0,       f0);',
+    '  float b = 1.0 - wor3(p*f0*2.0,   f0*2.0);',
+    '  float c = 1.0 - wor3(p*f0*4.0,   f0*4.0);',
+    '  return clamp(a*0.571 + b*0.286 + c*0.143, 0.0, 1.0); }'
+  ].join('\n');
+
   function buildNoise() {
     if (rtNoise) return;
-    /* NO MIPMAPS.  Every tap happens inside a raymarch loop, where the screen
-       derivatives that drive LOD selection are undefined — a mipped atlas
-       silently blurs to a random level per pixel and stipples the cloud.  The
-       feature scales below are instead chosen coarse enough (>= ~60 m) that
-       the march resolves them without aliasing in the first place.          */
-    rtNoise = new THREE.WebGLRenderTarget(512, 512, {
+
+    /* ---------------------------------------------------- weather map (2D) */
+    rtNoise = new THREE.WebGLRenderTarget(256, 256, {
       type: THREE.UnsignedByteType, format: THREE.RGBAFormat,
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
       wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping,
@@ -647,14 +841,10 @@
     });
     rtNoise.texture.colorSpace = THREE.LinearSRGBColorSpace;
     matNoise = post(new THREE.ShaderMaterial({
-      uniforms: {},
-      vertexShader: QUAD_VS,
+      uniforms: {}, vertexShader: QUAD_VS,
       fragmentShader: [
         'precision highp float;',
-        '/* the +offset and +phase matter: sin(dot(0,k))=0 makes lattice (0,0)',
-        '   exactly black, which visibly biases a low-period fbm. */',
         'float h1(vec2 p){ return fract(sin(dot(p+0.71,vec2(127.1,311.7))+1.7)*43758.5453123); }',
-        'float h2(vec2 p){ return fract(sin(dot(p+1.37,vec2(269.5,183.3))+4.3)*24634.6345); }',
         'float vn(vec2 p, float per){',
         '  vec2 i = floor(p), f = fract(p); vec2 u = f*f*(3.0-2.0*f);',
         '  float a=h1(mod(i,per)), b=h1(mod(i+vec2(1,0),per));',
@@ -665,35 +855,142 @@
         '  for (int i=0;i<6;i++){ if (i>=oct) break;',
         '    s += a*vn(p, per); n += a; p *= 2.0; per *= 2.0; a *= 0.5; }',
         '  return s/max(n,1e-4); }',
-        'float wor(vec2 p, float per){',
-        '  vec2 i = floor(p), f = fract(p); float m = 8.0;',
+        'vec2 h22(vec2 p){',
+        '  p = vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3)));',
+        '  return fract(sin(p+0.31)*43758.5453123); }',
+        '/* WORLEY CELLS, not fBm.  fBm remapped to 0..1 plateaus: adjacent lobes',
+        '   merge into a continuous 64%-coverage wall with two holes in the whole',
+        '   sky.  A cellular base gives DISCRETE convective cells with genuine',
+        '   blue between them, which is what trade-wind cumulus actually is.',
+        '   Returns .x = distance to the nearest feature point in cell units,',
+        '   .yz = that cell\'s wrapped integer id (so per-cell constants can be',
+        '   hashed off it — this is how every cloud gets ONE flat base). */',
+        'vec3 cellF1(vec2 p, float per){',
+        '  vec2 i = floor(p), f = fract(p);',
+        '  float best = 9.0; vec2 bid = i;',
         '  for (int y=-1;y<=1;y++) for (int x=-1;x<=1;x++){',
         '    vec2 g = vec2(float(x), float(y));',
-        '    vec2 mi = mod(i+g, per);',
-        '    vec2 o = vec2(h1(mi), h2(mi));',
-        '    m = min(m, length(g+o-f)); }',
-        '  return clamp(m, 0.0, 1.0); }',
+        '    vec2 id = mod(i+g, per);',
+        '    vec2 r = g + h22(id) - f;',
+        '    float dd = dot(r,r);',
+        '    if (dd < best){ best = dd; bid = id; } }',
+        '  return vec3(sqrt(best), bid); }',
         'void main(){',
-        '  vec2 uv = gl_FragCoord.xy/512.0;',
-        '  float base = fbm(uv*8.0, 8.0, 5);',
-        '  base = clamp((base-0.30)/0.55, 0.0, 1.0);',
-        '  float bl = 1.0 - wor(uv*6.0, 6.0);',
-        '  float bl2 = 1.0 - wor(uv*13.0, 13.0);',
-        '  float bill = clamp(bl*0.62 + bl2*0.38, 0.0, 1.0);',
-        '  /* A pure inverted-Worley field is bright at the feature points and',
-        '     DARK ALONG EVERY CELL BOUNDARY, i.e. it is a net.  Erode a cloud',
-        '     with that and you get a chain-link screen-door across the whole',
-        '     sky.  Cross-fade both cellular channels with plain fbm so the cell',
-        '     network dissolves and only the billow survives. */',
-        '  bill = clamp(mix(pow(bill,1.25), fbm(uv*11.0, 11.0, 4), 0.34), 0.0, 1.0);',
-        '  float det = fbm(uv*21.0, 21.0, 4);',
-        '  det = mix(det, 1.0-wor(uv*24.0,24.0), 0.20);',
-        '  float weather = fbm(uv*4.0 + 11.3, 4.0, 3);',
-        '  weather = clamp((weather-0.24)/0.52, 0.0, 1.0);',
-        '  gl_FragColor = vec4(base, bill, clamp(det,0.0,1.0), weather); }'
+        '  vec2 uv = gl_FragCoord.xy/256.0;',
+        '  /* 10 cells across the 26 km tile => ~2.6 km cell pitch, which is the',
+        '     real spacing of Caribbean trade cumulus. */',
+        '  vec3 cf = cellF1(uv*10.0, 10.0);',
+        '  vec2 cid = cf.yz;',
+        '  float r1 = h22(cid*1.7  + 3.1 ).x;',
+        '  float r3 = h22(cid*5.3  + 27.7).x;',
+        '  float r4 = h22(cid*0.61 + 41.9).y;',
+        '  /* PER-CELL RADIUS, skewed so most cells are modest and a few are very',
+        '     large — a real field has one huge near cloud and a crowd of little',
+        '     ones, not one uniform angular size everywhere.  The floor matters:',
+        '     a cumulus is about as wide as it is tall, so a cell narrower than',
+        '     ~900 m turns into a vertical PILLAR once the slab is 1.6 km deep. */',
+        '  float rad = mix(0.21, 0.56, r1*r1);',
+        '  float cell = 1.0 - smoothstep(rad*0.40, rad, cf.x);',
+        '  /* ragged the rim so cells are lobed, not discs — but multiplicative,',
+        '     so it can never re-open the gaps between cells. */',
+        '  float rag = fbm(uv*30.0 + r1*23.0, 30.0, 3);',
+        '  cell = clamp(cell*(0.66 + 0.72*rag), 0.0, 1.0);',
+        '  cell = cell*cell*(3.0 - 2.0*cell);',
+        '  /* CLOUD STREETS: a 5-13 km modulator that opens long clear lanes and',
+        '     packs the cells into rows.  This is what breaks the "every cloud the',
+        '     same size in one band" reading. */',
+        '  float st = fbm(uv*2.0 + 4.3, 2.0, 3);',
+        '  st = smoothstep(0.33, 0.63, st);',
+        '  float st2 = fbm(uv*5.0 + 19.7, 5.0, 3);',
+        '  st = clamp(st*(0.34 + 0.95*smoothstep(0.28, 0.72, st2)), 0.0, 1.0);',
+        '  /* g = per-cell vertical extent.  CORRELATED WITH THE RADIUS: a real',
+        '     cumulus is roughly as tall as it is wide, so a small cell must be a',
+        '     flat pancake and only the big cells become congestus towers.  Left',
+        '     decorrelated, every small cell grew into a chimney.  r4 adds a',
+        '     little spread around that relation so it is not a rigid formula.',
+        '     b = per-cell condensation level, CONSTANT across the cell so the',
+        '     base of each cloud is one razor-straight plane. */',
+        '  float vext = clamp(r1*r1*1.25 + 0.46*(r4 - 0.5), 0.0, 1.0);',
+        '  gl_FragColor = vec4(cell, vext, r3, st); }'
       ].join('\n')
     }));
     blit(matNoise, rtNoise);
+
+    /* -------------------------------------------------- shape volume 64^3 */
+    rtShape = new THREE.WebGLRenderTarget(520, 520, {
+      type: THREE.UnsignedByteType, format: THREE.RGBAFormat,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      wrapS: THREE.ClampToEdgeWrapping, wrapT: THREE.ClampToEdgeWrapping,
+      depthBuffer: false, stencilBuffer: false, generateMipmaps: false
+    });
+    rtShape.texture.colorSpace = THREE.LinearSRGBColorSpace;
+    var matShape = post(new THREE.ShaderMaterial({
+      uniforms: {}, vertexShader: QUAD_VS,
+      fragmentShader: [
+        'precision highp float;', NOISE3,
+        'void main(){',
+        '  vec2 fc = floor(gl_FragCoord.xy);',
+        '  vec2 tl = floor(fc/65.0);',
+        '  float sl = tl.y*8.0 + tl.x;',
+        '  vec2 it = fc - tl*65.0;',
+        '  vec3 ip = vec3(mod(it.x,64.0), mod(it.y,64.0), sl);',
+        '  vec3 p = ip/64.0;',
+        '  float pf = fbm3(p*4.0, 4.0, 5);',
+        '  pf = clamp((pf-0.26)/0.50, 0.0, 1.0);',
+        '  float wLo = worFbm(p, 3.0);',
+        '  /* Perlin-Worley: the fbm gives connected, wind-blown structure, the',
+        '     inverted Worley gives round convective lumps.  Remapping one by',
+        '     the other is what produces cauliflower rather than either a smooth',
+        '     blob field or a cell network. */',
+        '  float pw = clamp((pf - (1.0-wLo))/max(wLo, 1e-3), 0.0, 1.0);',
+        '  float G = wLo;',
+        '  float B = worFbm(p, 6.0);',
+        '  float A = clamp(1.0 - wor3(p*12.0, 12.0), 0.0, 1.0);',
+        '  gl_FragColor = vec4(pw, G, B, A); }'
+      ].join('\n')
+    }));
+    blit(matShape, rtShape);
+    matShape.dispose();
+
+    /* ------------------------------------------------- detail volume 32^3 */
+    rtDet = new THREE.WebGLRenderTarget(264, 132, {
+      type: THREE.UnsignedByteType, format: THREE.RGBAFormat,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      wrapS: THREE.ClampToEdgeWrapping, wrapT: THREE.ClampToEdgeWrapping,
+      depthBuffer: false, stencilBuffer: false, generateMipmaps: false
+    });
+    rtDet.texture.colorSpace = THREE.LinearSRGBColorSpace;
+    var matDet = post(new THREE.ShaderMaterial({
+      uniforms: {}, vertexShader: QUAD_VS,
+      fragmentShader: [
+        'precision highp float;', NOISE3,
+        '/* vector potential -> curl.  Integer offsets keep the lattice period',
+        '   intact so the curl field tiles with the volume. */',
+        'vec3 pot(vec3 p){',
+        '  return vec3(fbm3(p*3.0,                        3.0, 3),',
+        '              fbm3(p*3.0 + vec3(31.0,17.0, 5.0), 3.0, 3),',
+        '              fbm3(p*3.0 + vec3( 7.0,41.0,23.0), 3.0, 3)); }',
+        'vec3 curl3(vec3 p){',
+        '  float h = 0.03;',
+        '  vec3 dx = pot(p+vec3(h,0.0,0.0)) - pot(p-vec3(h,0.0,0.0));',
+        '  vec3 dy = pot(p+vec3(0.0,h,0.0)) - pot(p-vec3(0.0,h,0.0));',
+        '  vec3 dz = pot(p+vec3(0.0,0.0,h)) - pot(p-vec3(0.0,0.0,h));',
+        '  return vec3(dy.z-dz.y, dz.x-dx.z, dx.y-dy.x); }',
+        'void main(){',
+        '  vec2 fc = floor(gl_FragCoord.xy);',
+        '  vec2 tl = floor(fc/33.0);',
+        '  float sl = tl.y*8.0 + tl.x;',
+        '  vec2 it = fc - tl*33.0;',
+        '  vec3 ip = vec3(mod(it.x,32.0), mod(it.y,32.0), sl);',
+        '  vec3 p = ip/32.0;',
+        '  float d = worFbm(p, 3.0)*0.62 + (1.0 - wor3(p*8.0, 8.0))*0.38;',
+        '  vec3 c = curl3(p);',
+        '  c = c/max(length(c), 1e-4);',
+        '  gl_FragColor = vec4(clamp(d,0.0,1.0), c*0.5+0.5); }'
+      ].join('\n')
+    }));
+    blit(matDet, rtDet);
+    matDet.dispose();
   }
 
   /* ------------------------------------------------------- land mask texture
@@ -773,133 +1070,340 @@
   /*  towers coexist in the same sky.                                       */
   /* ====================================================================== */
   var CLOUD_FIELD = [
-    'uniform sampler2D uNoise, uLand;',
+    'uniform sampler2D uWeather, uShapeVol, uDetVol, uLand;',
     'uniform vec2 uWind, uCover, uShear, uRes;',
     'uniform vec3 uCam, uLightDir, uLightCol;',
     'uniform float uT, uSigma, uBase, uTop, uPowder, uAmb, uScale, uMaxD;',
-    'uniform float uDirect, uErode, uFade;',
+    'uniform float uDirect, uErode, uFade, uDebug, uSunPath, uSunGate;',
+    '',
+    '#define SH_N 64.0',
+    '#define SH_TW 65.0',
+    '#define SH_TEX 520.0',
+    '#define DT_N 32.0',
+    '#define DT_TW 33.0',
+    '',
+    '/* --- tileable 3D fetch out of a 2D slice atlas ------------------------',
+    '   The 65th (33rd) row and column of every tile duplicate the 0th, so the',
+    '   hardware bilinear wraps EXACTLY across the tile seam.  Only z needs a',
+    '   manual lerp, which is why this costs two taps and not eight.        */',
+    '/* C1 INTERPOLATION ON ALL THREE AXES.',
+    '   The volume is a 64^3 field sampled at 42 m per texel inside a 900 m cloud,',
+    '   so the interpolant is magnified ~20x and its continuity class is visible',
+    '   in the silhouette.  Hardware bilinear is C0: the gradient jumps at every',
+    '   texel boundary, and because one in-slice axis IS world altitude those',
+    '   jumps line up into horizontal terraces — the "stacked lenticular sheets"',
+    '   and Minecraft staircases.  Pre-warping the fractional part of the texel',
+    '   coordinate by smoothstep makes the SAME single bilinear tap behave like a',
+    '   cubic interpolant, at zero extra cost and zero extra taps.  The z (slice)',
+    '   axis gets the same treatment on its manual lerp. */',
+    'vec2 sailTexC1(vec2 t){',
+    '  vec2 i = floor(t), f = t - i;',
+    '  f = f*f*(3.0 - 2.0*f);',
+    '  return i + f + 0.5; }',
+    'vec4 vol3s(vec3 p){',
+    '  p = fract(p);',
+    '  float zf = p.z*SH_N, z0 = floor(zf), fz = zf - z0;',
+    '  fz = fz*fz*(3.0 - 2.0*fz);',
+    '  vec2 uv = sailTexC1(p.xy*SH_N);',
+    '  float s0 = mod(z0, SH_N), s1 = mod(z0+1.0, SH_N);',
+    '  vec2 o0 = vec2(mod(s0,8.0), floor(s0/8.0))*SH_TW;',
+    '  vec2 o1 = vec2(mod(s1,8.0), floor(s1/8.0))*SH_TW;',
+    '  return mix(texture2D(uShapeVol, (o0+uv)/SH_TEX),',
+    '             texture2D(uShapeVol, (o1+uv)/SH_TEX), fz); }',
+    'vec4 vol3d(vec3 p){',
+    '  p = fract(p);',
+    '  float zf = p.z*DT_N, z0 = floor(zf), fz = zf - z0;',
+    '  fz = fz*fz*(3.0 - 2.0*fz);',
+    '  vec2 uv = sailTexC1(p.xy*DT_N);',
+    '  float s0 = mod(z0, DT_N), s1 = mod(z0+1.0, DT_N);',
+    '  vec2 o0 = vec2(mod(s0,8.0), floor(s0/8.0))*DT_TW;',
+    '  vec2 o1 = vec2(mod(s1,8.0), floor(s1/8.0))*DT_TW;',
+    '  vec2 TX = vec2(264.0, 132.0);',
+    '  return mix(texture2D(uDetVol, (o0+uv)/TX),',
+    '             texture2D(uDetVol, (o1+uv)/TX), fz); }',
+    '',
     'float clLand(vec2 p){',
     '  vec2 uv = (p - vec2(' + LAND_ORIGIN.toFixed(1) + '))/' + LAND_SPAN.toFixed(1) + ';',
     '  return texture2D(uLand, clamp(uv, 0.004, 0.996)).r; }',
     '',
-    '/* hn = height fraction of the whole slab.  hh (out) = height fraction of',
-    '   THIS cell, which is what the shading needs: the top of a flat cell is',
-    '   just as sunlit as the top of a tower.                                */',
-    'float clDens(vec3 wp, float hn, float land, int lod, out float hh){',
-    '  hh = 0.0;',
+    'float rmp(float v, float a, float b){ return clamp((v-a)/max(b-a, 1e-4), 0.0, 1.0); }',
+    '',
+    '/* ======================================================================',
+    '   clDens — density of the cumulus field at a world point.',
+    '',
+    '   dsm  = the length in METRES of the march step this sample stands for.',
+    '          Every octave is gated against it, which is the whole reason the',
+    '          old build combed: it fetched 7 m features with a 125 m step and',
+    '          had no way to fade them out with distance.',
+    '   lod  = 0 full (shape + curl-warped detail erosion)',
+    '          1 shape only, no erosion  (sun march / occlusion taps)',
+    '          2 cheapest conservative overestimate (empty-space probe)',
+    '   hh   = out, height fraction WITHIN THIS CELL (not the slab), which is',
+    '          what the shading wants: the top of a pancake is as sunlit as the',
+    '          top of a tower.',
+    '   thk  = out, the METRIC thickness of this cell.  clShade needs it to turn',
+    '          hh into "how many metres of my own water is above me", which is',
+    '          the term that makes the crown-over-base ratio monotone no matter',
+    '          how coarse the stochastic sun march is.                        */',
+    'float clDens(vec3 wp, float land, int lod, float dsm, out float hh, out float thk){',
+    '  hh = 0.0; thk = 600.0;',
     '  vec2 q = wp.xz + uWind*uT;',
-    '  float w = texture2D(uNoise, q/34000.0).a;',
-    '  /* baked weather channel: mean 0.268, sd 0.089 -> (0.45+2.05w) is',
-    '     unity-mean and swings x0.45..x2.5 across the synoptic patches. */',
-    '  float cover = clamp(uCover.x*(0.45 + 2.05*w) + uCover.y*land, 0.0, 1.5);',
-    '  float ty = texture2D(uNoise, q/19000.0 + vec2(0.37,0.61)).r;',
-    '  float type = clamp(0.16 + 1.50*ty*ty + 0.30*land, 0.10, 1.0);',
-    '  float top = mix(0.24, 1.0, type);',
-    '  if (hn >= top) return 0.0;',
-    '  hh = hn/top;',
-    '  /* trade cumulus lean downwind as they build */',
-    '  /* Scale matters more than anything else here.  A trade cumulus is about',
-    '     as wide as it is tall (~1 km), so the dominant horizontal feature has',
-    '     to be ~1.5 km.  With 300 m features and a 1.6 km slab the rising',
-    '     threshold carves ice needles instead of cauliflower, no matter what',
-    '     the profile curve does. */',
-    '  vec2 qs = q + uShear*hn;',
-    '  float b  = texture2D(uNoise, qs/10500.0).r;',
-    '  float bi = texture2D(uNoise, (qs*1.20 + vec2(311.0,-197.0))/10500.0).g;',
-    '  /* Low in the cell the broad fbm decides the footprint; high in the cell',
-    '     the BILLOW takes over, which is what turns a smooth cone into a lumpy',
-    '     cauliflower crown. */',
-    '  /* A field extruded from 2D noise has a CONSTANT cross-section, so every',
-    '     cloud ends up with vertical planar walls — stone monoliths, not',
-    '     cumulus.  Translating a second slice by 2.4 km across the depth of the',
-    '     slab decorrelates base from top and buys real 3D billowing out of one',
-    '     more 2D fetch. */',
-    '  float v3 = texture2D(uNoise, (qs*1.90 + vec2(2400.0,-3100.0)*hn)/10500.0).g;',
-    '  float shape = mix(b*0.76 + bi*0.24, b*0.34 + bi*0.66, smoothstep(0.10, 0.85, hh));',
-    '  shape = shape*0.72 + v3*0.28;',
-    '  /* THE tower term.  The survival threshold climbs through the cell so',
-    '     only the strongest cores reach the top — but pow(hh,2.1) keeps the',
-    '     shoulders broad and puts all the narrowing in the last third, and the',
-    '     smoothstep WIDTH opens up with height so the crown is a soft dome.',
-    '     A linear rise with a fixed narrow width gives ice needles instead. */',
-    '  float thr = 0.660 - 0.445*cover + 0.185*pow(hh, 2.10);',
-    '  /* The transition WIDTH is the silhouette hardness.  A convecting top is',
-    '     a crisp cauliflower edge against the blue; only the dissipating flanks',
-    '     are soft.  So the width now NARROWS with height instead of opening up,',
-    '     and the erosion below sharpens it further. */',
-    '  float d = smoothstep(thr, thr + 0.185 - 0.045*smoothstep(0.25, 0.95, hh), shape);',
+    '  vec4 wm = texture2D(uWeather, q/26000.0);',
+    '  /* Coverage.  wm.r is now a WORLEY CELL field with real gaps, wm.a is the',
+    '     5-13 km cloud-street modulator.  Multiplying them (rather than adding',
+    '     a pedestal, which is what the old 0.26 + 1.58*wm.r did) is what keeps',
+    '     the clear lanes genuinely clear instead of filling them with a thin',
+    '     plateau that merges every cell into one wall. */',
+    '  float cvr = clamp(uCover.x*1.90*wm.r*(0.28 + 1.20*wm.a) + uCover.y*land*wm.r, 0.0, 1.0);',
+    '  if (cvr <= 0.006) return 0.0;',
+    '  /* Cloud type: 0 = 350 m pancake, 1 = congestus tower.  Land lifts it.',
+    '     Squared, so the tall ones are rare and genuinely tall (2-3x the mean)',
+    '     rather than everything sitting at one middling height. */',
+    '  /* Land bias 0.34 -> 0.13.  At 0.34 every cell over the island saturated',
+    '     the clamp at type = 1.0, so every cell over the island topped out at',
+    '     EXACTLY uTop — which is the unnaturally straight horizontal edge the',
+    '     review found capping the tall cumulus.  Orographic lift should bias the',
+    '     distribution, not collapse it, and the ceiling is now 0.96 so the clamp',
+    '     is never the thing that sets a cloud top. */',
+    '  float type = clamp(0.10 + 1.12*wm.g + 0.13*land, 0.06, 0.96);',
+    '  /* PER-CELL CONDENSATION LEVEL, constant across the cell (wm.b is hashed',
+    '     off the Worley cell id, not an fbm), so each cloud gets ONE razor-flat',
+    '     base and neighbours differ by at most +/-55 m.  Big jitter is what made',
+    '     the bases look random; no jitter is what made them look like a ruler. */',
+    '  float cb = uBase + 74.0*(wm.b - 0.5) - 34.0*land;',
+    '  /* Per-cell TOP spread.  wm.b is hashed off the Worley cell id so it is',
+    '     constant across a cell: a 0.80-1.24x multiplier on the vertical',
+    '     development means two cells of the same convective type still terminate',
+    '     at different altitudes, and no population of cells shares one ceiling. */',
+    '  float ct = cb + mix(300.0, uTop - uBase, type*type)*(0.80 + 0.44*wm.b);',
+    '  float thick = max(ct - cb, 80.0);',
+    '  thk = thick;',
+    '  hh = (wp.y - cb)/thick;',
+    '  if (hh > 1.05 || hh < -0.015) return 0.0;',
+    '  float hc = clamp(hh, 0.0, 1.0);',
+    '  /* THE LCL GATE — the defining silhouette feature of trade-wind cumulus.',
+    '     A 22 m transition, evaluated in METRES so it is the same knife edge on a',
+    '     300 m pancake and a 1900 m tower, and applied at every return path',
+    '     INCLUDING after erosion (the dripping stalactite fringes were erosion',
+    '     noise leaking through a gate applied too early).  Under 50 m of softening',
+    '     is what the reference asks for, and it is what fixes the altitude cue:',
+    '     with a soft base the eye has nothing to place the cloud deck against and',
+    '     the whole sky loses its sense of scale. */',
+    '  float gBot = smoothstep(0.0, 22.0/thick, hh);',
+    '  if (gBot <= 0.0) return 0.0;',
+    '',
+    '  /* --- height gradient: billowing crown, anvil on the tall ------------- */',
+    '  float anv  = smoothstep(0.74, 1.0, type)*smoothstep(0.60, 0.95, hc);',
+    '  float tTop = mix(0.42, 0.72, type);',
+    '  float gTop = smoothstep(1.10, tTop, hc);',
+    '  gTop = mix(gTop, max(gTop, 0.60*smoothstep(1.06, 0.80, hc)), anv);',
+    '  float grad = gBot*gTop;',
+    '  if (grad <= 0.0) return 0.0;',
+    '  /* THE CAULIFLOWER RULE.  The coverage threshold must RISE with height',
+    '     inside the cell, so only the strongest convective cores survive upward',
+    '     and the crown breaks into separate turrets of different heights.  Hold',
+    '     coverage constant with height and the cell fills the whole slab to a',
+    '     flat lid — a mesa, which is what the last pass produced. */',
+    '  float hcv = 1.0 - 0.46*smoothstep(0.16, 1.0, hc);',
+    '',
+    '  /* --- base shape, 3D ------------------------------------------------- */',
+    '  /* The sample position is DOMAIN-WARPED by a low-frequency curl field',
+    '     before the volume fetch.  Without it the 64 z-slices of the shape atlas',
+    '     are world-horizontal planes and every silhouette inherits an',
+    '     axis-aligned staircase; with it no grid axis survives into the',
+    '     silhouette and the terracing is gone.  y is stretched 1.55x so the 64',
+    '     slices cover ~2.7 km — one slice per ~42 m of cloud instead of 66. */',
+    '  vec3 wq = vec3(q.x + uShear.x*hc, wp.y*1.55, q.y + uShear.y*hc);',
+    '  vec3 wr = vol3d(wq/5600.0).gba - 0.5;',
+    '  vec3 P = (wq + wr*430.0)/4200.0;',
+    '  vec4 sn = vol3s(P);',
+    '  float fHi = 1.0 - smoothstep(0.85, 2.10, dsm/175.0);',
+    '  float fMd = 1.0 - smoothstep(0.85, 2.10, dsm/350.0);',
+    '  float wf = sn.g*0.545 + sn.b*0.305*fMd + sn.a*0.150*fHi;',
+    '  float wn = 0.545 + 0.305*fMd + 0.150*fHi;',
+    '  wf /= max(wn, 1e-3);',
+    '  float shp = rmp(sn.r, wf - 1.0, 1.0);',
+    '  float cov2 = clamp(cvr*hcv*(1.0 + 0.50*anv), 0.0, 1.0);',
+    '  /* THE DENSITY MUST SATURATE.  The old remap spread 0 -> 1 across the whole',
+    '     surviving range of the shape noise, so almost the entire volume of every',
+    '     cloud sat on a ramp and the median density measured 0.15 — an extinction',
+    '     of 0.009/m, roughly a tenth of real cumulus.  A ray then never',
+    '     accumulated enough optical depth for anything to shadow anything, which',
+    '     is the true root cause of the flat-white paper-cutout look: not the',
+    '     lighting model, the density.  Remapping over the first 55% of the range',
+    '     and clamping gives a genuine opaque PLATEAU with a thin rim, so cores',
+    '     self-shadow and the sun march finally sees 20-40 optical depths. */',
+    '  float cw = max(cov2*0.55, 0.05);',
+    '  float d = clamp((shp - (1.0 - cov2))/cw, 0.0, 1.0)*mix(0.62, 1.12, cov2)*grad;',
     '  if (d <= 0.0) return 0.0;',
-    '  d *= smoothstep(0.0, 0.028 + 0.055*bi, hh);',
-    '  d *= 1.0 - smoothstep(0.62, 1.0, hh*hh);',
-    '  d *= mix(0.62, 1.42, smoothstep(0.02, 0.44, hh));',
-    '  if (lod == 0){',
-    '    /* Three octaves of billow erosion, weighted hard toward the top of the',
-    '       cell: upper edges get bitten into cauliflower while the lower flanks',
-    '       stay soft and wispy.  Without this the cloud is a handful of smooth',
-    '       spheres — the cotton-wool signature. */',
-    '    float e1 = texture2D(uNoise, (qs*2.10 + vec2(-83.0, 57.0))/10500.0).b;',
-    '    float e2 = texture2D(uNoise, (qs*5.30 + vec2( 29.0,-41.0) + vec2(-1800.0,1500.0)*hn)/10500.0).b;',
-    /* e3 must stay COARSER than the march step (~125 m) or it aliases into
-       the stair-stepping that a raymarch shows on every silhouette: 10500/
-       (8.6*8) is a ~150 m feature, which the march resolves. */
-    '    float e3 = texture2D(uNoise, (qs*8.60 + vec2(517.0,-233.0) + vec2(900.0,-1400.0)*hn)/10500.0).b;',
-    '    float ew = uErode*(0.13 + 0.42*smoothstep(0.20, 0.98, hh));',
-    '    d = clamp(d - (1.0-d)*(e1*0.44 + e2*0.34 + e3*0.22)*ew, 0.0, 1.0); }',
-    '  return d; }',
+    '  /* denser toward the crown — the convective profile */',
+    '  d *= mix(0.62, 1.38, smoothstep(0.03, 0.52, hc));',
+    '  if (lod >= 1) return d;',
     '',
-    'float clLight(vec3 wp, float land){',
-    '  float tau = 0.0, t = 0.0, ds = 46.0, hh;',
+    '  /* --- edge erosion: curl-warped detail ------------------------------- */',
+    '  /* CLAMPED so it can only ever bite the TRANSLUCENT flanks.  The old',
+    '     rmp(d, dmod*ew, 1.0) was a subtract-and-renormalise that could reach',
+    '     straight through an opaque core, and where a Worley cell boundary',
+    '     happened to close on itself that came out as a perfect torus hole.',
+    '     Scaling the bite by (1 - smoothstep(d)) makes a hole in a core',
+    '     arithmetically impossible.  Three frequency bands, each gated on the',
+    '     step length so they dissolve rather than beat against the lattice. */',
+    '  /* Feature sizes 55 m / 24 m rather than 38 m / 16 m.  At a typical cumulus',
+    '     distance of 3-8 km the march step is ~40 m, which gated the fine octave',
+    '     completely off and left the interiors as smooth blobs — the "featureless',
+    '     paper cutout" complaint.  Sized just above the step, both octaves',
+    '     survive where the clouds actually are and still dissolve into clean',
+    '     silhouette at the horizon instead of beating against the lattice. */',
+    '  float f1 = 1.0 - smoothstep(0.70, 1.80, dsm/55.0);',
+    '  float f2 = 1.0 - smoothstep(0.70, 1.80, dsm/24.0);',
+    '  if (f1 <= 0.02) return d;',
+    '  vec3 Pd = (wq + wr*150.0)/600.0 + vec3(0.0, uT*0.0022, 0.0);',
+    '  vec4 dv = vol3d(Pd);',
+    '  float dn = dv.r*0.60*f1, wsum = 0.60*f1;',
+    '  if (f2 > 0.02){',
+    '    vec3 crl = dv.gba*2.0 - 1.0;',
+    '    dn += vol3d(Pd*2.35 + crl*0.30).r*0.40*f2; wsum += 0.40*f2; }',
+    '  dn /= max(wsum, 1e-3);',
+    '  /* wispy (inverted, filament-like) low in the cell, billowy at the top */',
+    '  float dmod = mix(1.0 - dn, dn, clamp(hc*2.4, 0.0, 1.0));',
+    '  float ew = uErode*(0.32 + 0.60*smoothstep(0.10, 0.95, hc));',
+    '  ew *= clamp(wsum/0.60, 0.0, 1.0);',
+    '  d = max(d - ew*dmod*(1.0 - smoothstep(0.13, 0.58, d)), 0.0);',
+    '  /* gate AGAIN, after erosion, so nothing drips below the condensation',
+    '     level; the erosion carves the flanks and the gate cuts the floor. */',
+    '  return d*gBot; }',
+    '',
+    '/* ======================================================================',
+    '   clLight — optical depth from wp to the sun, in metres of unit density.',
+    '',
+    '   TWO TERMS, and the second one is the whole fix for the inverted lighting.',
+    '',
+    '   (a) A stochastic exponential march, 6 taps from 34 m out to ~2.4 km.  The',
+    '       old one stopped at 1.27 km, which at a 29 deg sun is only 610 m of',
+    '       VERTICAL rise — less than half the depth of a congestus cell — so a',
+    '       base point never saw the water above it and came back as lit as the',
+    '       crown.  The perpendicular cone was also 0.22*t wide, i.e. +/-140 m at',
+    '       the far tap, so most of the far samples fell out of the cloud',
+    '       altogether and the little depth it did find got averaged away.  Reach',
+    '       doubled, cone tightened to 0.075*t.',
+    '',
+    '   (b) An ANALYTIC column term.  Any stochastic march is a noisy estimator,',
+    '       and a noisy estimator of a quantity that must be MONOTONE in height is',
+    '       exactly what produced a base measurably brighter than the crown.  So',
+    '       the geometric depth of the cell above the sample — (1-hh)*thickness,',
+    '       divided by sin(sun elevation) — is added deterministically.  It',
+    '       saturates smoothly at ~520 m of path because a real sun ray exits',
+    '       sideways through the flank of a 1 km-wide cell rather than climbing',
+    '       the entire column, so an unbounded term would black out everything',
+    '       below the top 10%.  This is what guarantees the crown/base ordering',
+    '       regardless of step count, and it costs no taps.                     */',
+    'float clLight(vec3 wp, float land, float d, float hh, float thk, float seed){',
+    '  float tau = 0.0, t = 0.0, ds = 34.0, h2, k2;',
+    '  vec3 L = uLightDir;',
+    '  vec3 e1 = normalize(cross(L, vec3(0.0,1.0,0.0)) + vec3(1e-3,0.0,1e-3));',
+    '  vec3 e2 = cross(L, e1);',
+    '  float near = 0.0;',
     '  for (int i=0;i<CL_LIGHT;i++){',
-    '    t += ds*0.5;',
-    '    vec3 p = wp + uLightDir*t;',
-    '    float hn = (p.y - uBase)/(uTop - uBase);',
-    '    if (hn > 0.0 && hn < 1.0) tau += clDens(p, hn, land, 1, hh)*ds;',
-    '    t += ds*0.5; ds *= 1.82; }',
-    '  return tau; }',
+    '    vec3 j = sailHash33(floor(wp*0.5) + vec3(float(i)*13.7 + seed)) - 0.5;',
+    '    float tm = t + ds*(0.5 + 0.40*j.x);',
+    '    vec3 p = wp + L*tm + (e1*j.y + e2*j.z)*(tm*0.075);',
+    '    if (p.y > uBase - 240.0 && p.y < uTop + 320.0){',
+    '      float dq = clDens(p, land, 1, max(ds, 80.0), h2, k2)*ds;',
+    '      tau += dq;',
+    '      if (i < 3) near += dq; }',
+    '    t += ds; ds *= 2.06; }',
+    '  /* THE BURIED GATE.  The analytic term below extrapolates the column that',
+    '     the march is too short to reach, and it is only legitimate where the',
+    '     march already found cloud between this sample and the sun.  Without the',
+    '     gate it fires on the sunlit cap of every turret as well — hh is the',
+    '     height fraction of the CELL, and a cauliflower crown sits at hh 0.5-0.9',
+    '     because ct is the cell MAXIMUM, not the local surface — which blacks out',
+    '     precisely the pixels that are supposed to be at the top of the range.',
+    '     near is the optical depth found inside the first ~250 m along the sun',
+    '     ray, so an exposed surface reads 0 and stays fully lit while a sample',
+    '     under a kilometre of its own water gets the whole remaining column. */',
+    '  float buried = clamp(near/uSunGate, 0.0, 1.0);',
+    '  float above = clamp(1.0 - hh, 0.0, 1.0)*thk;',
+    '  float ly = max(abs(uLightDir.y), 0.26);',
+    '  float pathA = above/ly;',
+    '  pathA = pathA/(1.0 + pathA*0.0012);           /* soft-max at ~830 m */',
+    '  /* Deliberately NOT scaled by the local density.  Using d here inverts the',
+    '     term over the lower body — clDens thins the sub-cloud layer to 0.62 of',
+    '     the core, so a base sample would report LESS column above it than a',
+    '     mid-cell sample and come back brighter, which is the exact failure this',
+    '     term exists to kill.  A fixed nominal 0.70 core density keeps it purely',
+    '     geometric and therefore strictly monotone in height. */',
+    '  return tau + buried*pathA*uSunPath; }',
     '',
-    '/* Sunlit cauliflower top vs soft grey-blue base.  Three things make that',
-    '   separation: the sun-ray march (self-shadowing), an upward occlusion tap',
-    '   that darkens anything with cloud over it, and an ambient term that is a',
-    '   real gradient from bright zenith sky down to dark sea-bounce.        */',
-    /* TWO COLOURED SOURCES, NOT ONE SCALAR.
-       A cloud is white water droplets lit by (a) direct sun, which is warm and
-       gets warmer as it sets, and (b) the sky hemisphere, which is blue.  If
-       both terms carry the same chromaticity the cloud reads as grey felt: lit
-       side and shadow side differing only in value is the single most reliable
-       tell of CG cloud.  So the direct term is multiplied by the SUN's
-       chromaticity (uLightCol) and the fill by the SKY's (aUp/aDn, which the
-       march derives from the actual sky radiance in the upward hemisphere).
-
-       Getting the split right also means the direct multiple-scattering
-       octaves have to DIE with depth.  The old a*=0.66 / b*=0.32 ladder left
-       ~20% of full sunlight leaking through unattenuated at any optical depth,
-       which poured white light into the shadow side and washed the blue fill
-       straight back out.  The ladder below drops to ~12% of the top by the
-       time the ray has 8 optical depths of cloud over it, which is what lets
-       the skylight own the base.                                            */
-    'vec3 clShade(vec3 wp, float hh, float land, float d, float nu, vec3 aUp, vec3 aDn){',
-    '  float dl = clLight(wp, land)*uSigma;',
-    '  float lum = 0.0;',
-    '  float a = 1.0, b = 1.0, c = 1.0;',
-    '  for (int o=0;o<4;o++){',
-    '    float ph = mix(sailHG(nu, 0.84*c), sailHG(nu, -0.38*c), 0.24);',
+    '/* TWO COLOURED SOURCES, NOT ONE SCALAR.  The direct term carries the SUN\'s',
+    '   chromaticity, the fill carries the SKY\'s.  A cloud whose lit side and',
+    '   shadow side differ only in value is the most reliable tell of CG cloud. */',
+    'vec3 clShade(vec3 wp, float hh, float thk, float land, float d, float nu, vec3 aUp, vec3 aDn, float seed){',
+    '  float dl = clLight(wp, land, d, hh, thk, seed)*uSigma;',
+    '  /* uDebug: 1 = sun-ray optical depth, 2 = local density, 3 = height',
+    '     fraction.  Left in deliberately — every regression in this subsystem so',
+    '     far has been invisible in the beauty image and obvious in one of these. */',
+    '  if (uDebug > 0.5){',
+    '    if (uDebug < 1.5) return vec3(clamp(dl/12.0, 0.0, 1.0))*36.0;',
+    '    if (uDebug < 2.5) return vec3(clamp(d, 0.0, 1.0))*36.0;',
+    '    return vec3(clamp(hh, 0.0, 1.0))*36.0; }',
+    '  /* WRENNINGE MULTIPLE-SCATTER OCTAVES.  Extinction, albedo and phase',
+    '     eccentricity all scale by ~0.5^n, so the deep core goes MILKY GREY',
+    '     rather than either clipping to white or going black, and the outer',
+    '     shell keeps a sharp forward lobe for the silver lining.  Critically',
+    '     this is FULL Beer-Lambert exp(-sigma_t*depth) — the previous build',
+    '     saturated through a 1-exp remap, which is exactly why the whole cloud',
+    '     field measured 0.5 stops end to end. */',
+    '  /* The ladder has to keep BITING.  With b *= 0.42 the third octave ran at',
+    '     0.176 of the true extinction, so a base sample sitting under 20 optical',
+    '     depths still returned exp(-3.5) from it — a floor that no amount of',
+    '     shadowing could push through, and the single largest contributor to the',
+    '     0.19-stop flat column.  0.42 -> 0.34 on the extinction and 0.46 -> 0.40',
+    '     on the weight puts the deep core two full stops lower while leaving the',
+    '     milky (not black) look of a real cumulus interior intact.  The backward',
+    '     lobe mix drops 0.26 -> 0.17 for the same reason: HG(-0.32) is almost',
+    '     isotropic, and an isotropic lobe is a view-independent pedestal. */',
+    '  float lum = 0.0, a = 1.0, b = 1.0, c = 1.0;',
+    '  for (int o=0;o<3;o++){',
+    '    float ph = mix(sailHG(nu, 0.78*c), sailHG(nu, -0.30*c), 0.17);',
     '    lum += a*exp(-dl*b)*ph;',
-    '    a *= 0.10; b *= 0.45; c *= 0.85; }',
-    '  /* powder / dark-edge, keyed to LOCAL density over a fixed reference',
-    '     length so it never swings with the step size or view elevation */',
-    '  float pw = 1.0 - exp(-d*uSigma*300.0);',
-    '  lum *= mix(1.0, clamp(pw*1.60, 0.0, 1.35), uPowder);',
-    '  float hu; vec3 up1 = wp + vec3(0.0, 260.0, 0.0);',
-    '  float h1 = (up1.y - uBase)/(uTop - uBase);',
-    '  float du = (h1 > 0.0 && h1 < 1.0) ? clDens(up1, h1, land, 1, hu) : 0.0;',
-    '  float occ = mix(1.0, 0.66, clamp(du*1.9, 0.0, 1.0));',
-    '  vec3 amb = mix(aDn, aUp, clamp(hh*1.25, 0.0, 1.0))*occ*uAmb;',
+    '    a *= 0.40; b *= 0.34; c *= 0.58; }',
+    '  /* POWDER.  Keyed to the LOCAL density and the sun-ray depth together, so',
+    '     it goes to zero on a thin translucent flank and on the walls of a',
+    '     crevice (both of which are then dark) and saturates a few tens of',
+    '     metres inside a lit cauliflower cap.  Strongest looking down-sun, which',
+    '     is where the effect physically is.  Note this only ever DARKENS: the',
+    '     old term multiplied the core by 1.25 and lifted the very pixels that',
+    '     were supposed to be carrying the bottom of the range. */',
+    '  float pw = 1.0 - exp(-2.6*(dl + d*7.0));',
+    '  lum *= mix(1.0, pw, uPowder*(0.42 + 0.58*clamp(nu, 0.0, 1.0)));',
+    '  /* AMBIENT — the single largest reason the bases were blown out.  A cloud',
+    '     base does NOT see the sky: it is at the bottom of a kilometre of its',
+    '     own water, looking down at a 6%-albedo sea.  So the fill runs from a',
+    '     weak blue-green sea bounce at hh = 0 to the full sky irradiance at the',
+    '     crown, and the whole term is ~15-20% of a sunlit top instead of ~60%.',
+    '     aUp carries the SKY chromaticity (blue at noon, violet-blue at golden',
+    '     hour), uLightCol carries the SUN chromaticity — never the same colour,',
+    '     which is what gives shaded flanks their cool cast against warm tops. */',
+    '  float hu, ku; vec3 up1 = wp + vec3(0.0, 240.0, 0.0);',
+    '  float du = (up1.y < uTop + 260.0) ? clDens(up1, land, 1, 240.0, hu, ku) : 0.0;',
+    '  float occ = 1.0 - 0.62*clamp(du*2.4, 0.0, 1.0);',
+    '  /* The sky-visibility ramp is CUBIC, not smoothstep.  A smoothstep spends',
+    '     half its range in the bottom half of the cell, which handed a base',
+    '     sample ~35% of the crown fill; a base under a kilometre of water sees',
+    '     essentially none of the sky hemisphere.  vis^2 pins the fill to the',
+    '     upper third where it physically belongs, which is what finally lets the',
+    '     underside read as a cool grey-blue plane instead of a lit surface. */',
+    '  float vis = clamp(hh, 0.0, 1.0);',
+    '  vis = vis*vis*(3.0 - 2.0*vis); vis *= vis;',
+    '  vec3 amb = mix(aDn, aUp, vis)*occ*uAmb;',
     '  return uLightCol*(lum*uDirect) + amb; }',
     ''
   ].join('\n');
 
   /* The march itself, shared verbatim by both passes.  CL_PANO selects the
-     ray generator and the output path.                                     */
+     ray generator and the output path; CL_SHMAP builds the exported cloud
+     shadow plane instead of an image.                                      */
   var CLOUD_MARCH = [
     '#ifndef CL_PANO',
     'uniform vec3 uFwd, uRight, uUp, uPFwd, uPRight, uPUp;',
@@ -913,12 +1417,28 @@
     '  float az = (pp.x-0.5)*2.0*SAIL_PI;',
     '  float el = pp.y*pp.y*(0.5*SAIL_PI);',
     '  vec3 dir = vec3(sin(az)*cos(el), sin(el), -cos(az)*cos(el));',
-    '  float dith = fract(52.9829189*fract(dot(gl_FragCoord.xy, vec2(0.06711056,0.00583715))));',
+    '  /* R2 low-discrepancy dither.  The panorama has no temporal accumulation to',
+    '     hide behind, so its offset field has to be good in ONE sample: plain IGN',
+    '     lays down a regular diagonal lattice, and at 2048x1024 magnified 1.7x on',
+    '     screen that lattice is directly visible as the fixed grid of dither',
+    '     squares the review found with blue punching through it.  The R2 sequence',
+    '     is the best known 2D low-discrepancy point set and its residual is',
+    '     isotropic, so what is left dissolves under the Catmull-Rom tap instead',
+    '     of aligning into blocks.  A slow uT term keeps it from being a FROZEN',
+    '     lattice without introducing frame-to-frame flicker (the pano refreshes',
+    '     one band at a time, so this drifts over ~seconds, not frames). */',
+    '  float dith = fract(dot(gl_FragCoord.xy, vec2(0.7548776662, 0.5698402910)) + uT*0.017);',
     '#else',
     '  vec2 uv = gl_FragCoord.xy/uRes;',
     '  vec2 nd = uv*2.0 - 1.0;',
     '  vec3 dir = normalize(uFwd + uRight*(nd.x*uTan.x) + uUp*(nd.y*uTan.y));',
-    '  float dith = fract(52.9829189*fract(dot(gl_FragCoord.xy, vec2(0.06711056,0.00583715))) + uFrame*0.6180339887);',
+    '  /* Spatiotemporal offset: interleaved-gradient noise (which is close to',
+    '     blue over a 3x3 neighbourhood) DECORRELATED by a per-pixel white hash,',
+    '     then advanced by the golden ratio per frame.  Plain IGN alone lays down',
+    '     the faint 2 px diagonal comb that survived TAA in the last build. */',
+    '  float ign = fract(52.9829189*fract(dot(gl_FragCoord.xy, vec2(0.06711056,0.00583715))));',
+    '  float wn  = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453);',
+    '  float dith = fract(ign + 0.37*wn + uFrame*0.6180339887);',
     '#endif',
     '  vec4 res = vec4(0.0, 0.0, 0.0, 1.0);',
     '  float r0 = SAIL_RG + max(uCam.y, 0.5)*0.001;',
@@ -926,7 +1446,11 @@
     '  float kk = r0*r0*(mu*mu - 1.0);',
     '  float dg = kk + SAIL_RG*SAIL_RG;',
     '  bool below = (mu < 0.0 && dg > 0.0 && (-r0*mu - sqrt(dg)) > 0.0);',
-    '  float rb = SAIL_RG + uBase*0.001, rt = SAIL_RG + uTop*0.001;',
+    '  /* The geometric slab has to contain the JITTERED bases and the anvils,',
+    '     not just uBase..uTop, or the per-cell base jitter gets clipped back',
+    '     into the flat plane it exists to destroy. */',
+    '  float slabLo = uBase - 190.0, slabHi = uTop + 300.0;',
+    '  float rb = SAIL_RG + slabLo*0.001, rt = SAIL_RG + slabHi*0.001;',
     '  float dtop = kk + rt*rt;',
     '  if (!below && dtop > 0.0){',
     '    float t1 = min(-r0*mu + sqrt(dtop), uMaxD);',
@@ -947,40 +1471,79 @@
     '      vec3 sCh = sMix/sL;',
     '      float ambE = max(uSkySkyE, 0.0);',
     '      vec3 nAmb = vec3(0.011,0.016,0.036)*uSkyNight*(0.34 + 2.6*uSkyMoonE);',
-    '      /* The two taps under-report the hemispheric fill (a real cloud face',
-    '         integrates the whole sky, including the luminous horizon band and',
-    '         the forward-scattered light around the sun), so the coefficient is',
-    '         above the naive rho*E/pi.  This term is what carries the base: get',
-    '         it wrong and the shadow side falls back to grey sunlight leak. */',
-    '      vec3 aUp = sCh*(ambE*0.62) + nAmb;',
+    '      /* TWO LOBES, and they must not be the same size.  The old pair had',
+    '         aDn (0.66) LARGER than aUp (0.62) — the underside of every cloud in',
+    '         the sky was getting more fill than the crown, which is physically',
+    '         backwards and is what pinned the 5th percentile at sRGB 189.  aUp',
+    '         is the sky hemisphere seen by an unoccluded crown; aDn is what a',
+    '         base actually sees, which is a 6%-albedo sea and its own shadow. */',
+    '      /* The reference wants the underside driven by a sky-dome ambient at',
+    '         0.15-0.25 of the sun term and blue-biased.  aDn is deliberately',
+    '         COOLER than aUp, not merely darker: sCh is the real sky chromaticity',
+    '         and the sea bounce laid over it is blue-green, so an underside can',
+    '         never come back warmer than a sun-tinted crown the way it did. */',
+    '      vec3 aUp = sCh*(ambE*0.82) + nAmb;',
     '      /* sea bounce: weak, blue-green, and only ever on the underside */',
-    '      vec3 aSea = vec3(0.24,0.46,0.52)*(ambE*0.018 + max(uSkySunE,0.0)*0.0045);',
-    '      vec3 aDn = sCh*(ambE*0.66) + aSea + nAmb*0.55;',
+    '      vec3 aSea = vec3(0.20,0.42,0.54)*(ambE*0.018 + max(uSkySunE,0.0)*0.0030);',
+    '      vec3 aDn = sCh*(ambE*0.36) + aSea + nAmb*0.35;',
     '      float nu = dot(dir, uLightDir);',
     '      vec3 scat = vec3(0.0);',
     '      float T = 1.0, mdist = 0.0, mw = 0.0;',
-    '      /* Step length is the max of "cover the span in CL_TARGET samples"',
-    '         and "1% of the distance", so the sample spacing stays roughly',
-    '         constant in SCREEN space.  That is what lets the march reach the',
-    '         130 km needed to put cloud on the horizon line without spending',
-    '         a thousand steps to get there. */',
-    '      float ds = max(min(span/float(CL_TARGET), 0.125), t0*0.0085);',
-    '      float t = t0 + ds*dith;',
+    '      /* ---------------- ADAPTIVE MARCH -------------------------------',
+    '         Two step lengths.  Empty space is probed with a cheap shape-only',
+    '         density at 3.2x the fine step; the first hit steps BACK one coarse',
+    '         step and drops into fine stepping, and six consecutive misses',
+    '         return to coarse.  Because the coarse probe omits only erosion,',
+    '         which can only REDUCE density, the probe is a conservative',
+    '         overestimate and cannot skip past cloud.',
+    '',
+    '         The jitter advances EVERY step by the R1 low-discrepancy constant',
+    '         instead of being applied once at ray entry.  A single entry offset',
+    '         only randomises the PHASE of the sample lattice; the shells are',
+    '         still coherent, and since the entry offset was a function of ray',
+    '         elevation alone the beat ran along iso-elevation arcs — which is',
+    '         precisely the rotating comb/fan the review flagged.            */',
+    '      float ds0 = clamp(span/float(CL_TARGET), 0.014, 0.040);',
+    '      float t = t0, jt = dith, miss = 0.0, refine = 0.0;',
+    '      bool inC = false;',
     '      for (int i=0;i<CL_STEPS;i++){',
-    '        if (t >= t1 || T < 0.012) break;',
-    '        vec3 q = vec3(dir.x*t, r0 + dir.y*t, dir.z*t);',
-    '        float hgt = (length(q) - SAIL_RG)*1000.0;',
-    '        float hn = (hgt - uBase)/(uTop - uBase);',
-    '        if (hn > 0.0 && hn < 1.0){',
-    '          vec3 wp = vec3(uCam.x + dir.x*t*1000.0, hgt, uCam.z + dir.z*t*1000.0);',
-    '          float land = clLand(wp.xz);',
-    '          float hh; float d = clDens(wp, hn, land, 0, hh);',
-    '          if (d > 0.004){',
-    '            vec3 src = clShade(wp, hh, land, d, nu, aUp, aDn);',
+    '        if (t >= t1 || T < 0.008) break;',
+    '        /* dsN is the NOMINAL step for this distance and is what drives the',
+    '           octave LOD gates.  It must NOT follow the refinement halving:',
+    '           when it did, the six refinement steps ran the erosion octaves at',
+    '           full strength and every step after them ran with the octaves',
+    '           gated off, so each cloud grew a detailed outer shell wrapped',
+    '           round a smooth interior — visible as concentric horizontal',
+    '           "stacked lenticular plate" seams.  Frequency content has to be a',
+    '           function of distance alone, never of the marcher\'s state. */',
+    '        float dsN = max(ds0, t*0.0050);',
+    '        float dsF = (refine > 0.0) ? dsN*0.5 : dsN;',
+    '        float dsC = dsF*3.0;',
+    '        float ds = inC ? dsF : dsC;',
+    '        jt = fract(jt + 0.6180339887);',
+    '        float ts = t + ds*(0.5 + 0.60*(jt - 0.5));',
+    '        vec3 qv = vec3(dir.x*ts, r0 + dir.y*ts, dir.z*ts);',
+    '        float hgt = (length(qv) - SAIL_RG)*1000.0;',
+    '        if (hgt < slabLo || hgt > slabHi){ t += ds; continue; }',
+    '        vec3 wp = vec3(uCam.x + dir.x*ts*1000.0, hgt, uCam.z + dir.z*ts*1000.0);',
+    '        float land = clLand(wp.xz);',
+    '        float dsm = dsN*1000.0;',
+    '        float hh, thk;',
+    '        if (!inC){',
+    '          if (clDens(wp, land, 2, dsm, hh, thk) > 0.0){',
+    '            inC = true; miss = 0.0; refine = 6.0; t = max(t - dsC*0.96, t0); }',
+    '          else t += ds;',
+    '        } else {',
+    '          float d = clDens(wp, land, 0, dsm, hh, thk);',
+    '          if (d > 0.0030){',
+    '            vec3 src = clShade(wp, hh, thk, land, d, nu, aUp, aDn, dith*11.0);',
     '            float stepT = exp(-d*uSigma*ds*1000.0);',
     '            float wgt = T*(1.0 - stepT);',
-    '            scat += src*wgt; mdist += t*wgt; mw += wgt; T *= stepT; } }',
-    '        t += ds; ds = max(ds, t*0.0085); }',
+    '            scat += src*wgt; mdist += ts*wgt; mw += wgt; T *= stepT;',
+    '            miss = 0.0;',
+    '          } else { miss += 1.0; if (miss > 6.0){ inC = false; refine = 0.0; } }',
+    '          refine = max(refine - 1.0, 0.0);',
+    '          t += ds; } }',
     '      float cov = 1.0 - T;',
     '      if (cov > 1e-4){',
     '        /* Distant cloud must DESATURATE INTO THE HAZE BAND, never fade',
@@ -995,7 +1558,13 @@
     '           than ending up darker and higher-contrast than the near ones. */',
     '        vec3 Ta = pow(max(sailAerialTransmittance(uCam + dir*dm, uCam), vec3(1e-5)), vec3(uFade));',
     '        vec3 ins = skyRadianceBase(dir, uSkySunDir) + sailNightSky(dir);',
-    '        scat = scat*Ta + ins*(vec3(1.0)-Ta)*cov; }',
+    '        scat = scat*Ta + ins*(vec3(1.0)-Ta)*cov;',
+    '        /* Anything the march could not finish (the near-horizon chord is',
+    '           tens of km long) is handed to the haze rather than left as a',
+    '           truncated scummy band of half-integrated cloud. */',
+    '        float unf = smoothstep(0.0, 1.0, (t1 - t)/max(span, 1e-4));',
+    '        float hzf = 1.0 - unf*smoothstep(0.030, 0.0, dir.y + 0.004);',
+    '        T = mix(1.0, T, hzf); scat *= hzf; }',
     '      scat = max(scat, vec3(0.0));',
     '      float lm = dot(scat, vec3(0.3333));',
     '      if (!(lm < 1e5)) { scat = vec3(0.0); T = 1.0; }',
@@ -1006,9 +1575,14 @@
     '  /* Temporal reprojection.  The cloud deck is effectively at infinity for',
     '     rotation, so reprojecting the VIEW DIRECTION through the previous',
     '     frame basis is exact for a pure pan/tilt and near-exact for the slow',
-    '     translation of a boat.  History is rejected outright off-screen and',
-    '     weighted down wherever the silhouette actually changed, which is the',
-    '     only place ghosting is visible. */',
+    '     translation of a boat.',
+    '',
+    '     The rejection window used to open at dd = 0.030, which sat INSIDE the',
+    '     frame-to-frame swing of the ray jitter — so the TAA threw away history',
+    '     at exactly the pixels the jitter needed averaged, and the banding it',
+    '     was supposed to dissolve survived to be bilinearly feathered on',
+    '     upsample.  The knee is now above the jitter amplitude and only real',
+    '     silhouette motion rejects. */',
     '  if (uHistOn > 0.5){',
     '    float f = dot(dir, uPFwd);',
     '    if (f > 0.06){',
@@ -1017,17 +1591,43 @@
     '      if (pu.x > 0.002 && pu.x < 0.998 && pu.y > 0.002 && pu.y < 0.998){',
     '        vec4 h = texture2D(uHist, pu);',
     '        float dd = abs(h.a - res.a) + 0.30*length(h.rgb - res.rgb)/(1.0 + length(res.rgb));',
-    '        float w = 0.82*(1.0 - smoothstep(0.030, 0.24, dd));',
+    '        float w = 0.93*(1.0 - smoothstep(0.230, 0.62, dd));',
     '        res = mix(res, h, w); } } }',
     '  gl_FragColor = res;',
     '#endif',
     '}'
   ].join('\n');
 
+  /* ------------------------------------------------- exported cloud shadow
+     Sun-ray transmittance of the deck, evaluated on the y = 0 plane over a
+     square box snapped to the texel grid and centred on the camera.  This is
+     the ONLY thing the rest of the project needs in order to drag real cloud
+     shadows across the sea and the island: sailCloudShadow(worldPos).      */
+  var CLOUD_SHMAP = [
+    'uniform vec2 uShOrigin; uniform float uShSpan;',
+    'void main(){',
+    '  vec2 uv = gl_FragCoord.xy/uRes;',
+    '  vec2 g = uShOrigin + uv*uShSpan;',
+    '  vec3 L = uLightDir;',
+    '  float ly = max(L.y, 0.10);',
+    '  vec3 p0 = vec3(g.x, 0.0, g.y);',
+    '  float tA = (uBase - 190.0)/ly, tB = (uTop + 300.0)/ly;',
+    '  float ds = (tB - tA)/float(CL_SHSTEPS);',
+    '  float dith = fract(52.9829189*fract(dot(gl_FragCoord.xy, vec2(0.06711056,0.00583715))));',
+    '  float tau = 0.0, hh, thk;',
+    '  for (int i=0;i<CL_SHSTEPS;i++){',
+    '    vec3 p = p0 + L*(tA + ds*(float(i) + dith));',
+    '    tau += clDens(p, clLand(p.xz), 1, 300.0, hh, thk)*ds; }',
+    '  float tr = exp(-tau*uSigma);',
+    '  gl_FragColor = vec4(tr, tr, tr, 1.0); }'
+  ].join('\n');
+
   function cloudUniforms(w, h) {
     return {
       uRes:      { value: new THREE.Vector2(w, h) },
-      uNoise:    { value: rtNoise.texture },
+      uWeather:  { value: rtNoise.texture },
+      uShapeVol: { value: rtShape.texture },
+      uDetVol:   { value: rtDet.texture },
       uLand:     { value: landTex },
       uCam:      { value: new THREE.Vector3(0, 2, 0) },
       uWind:     { value: new THREE.Vector2(0, 0) },
@@ -1040,10 +1640,14 @@
          genuinely opaque — you cannot see stars, blue sky or another cloud
          through the middle of one — so this has to be high enough that a
          300 m chord already gives several optical depths. */
-      uSigma:    { value: 0.052 },
+      /* 0.052 -> 0.090 /m at unit density.  Real cumulus runs 0.06-0.10 /m in a
+         dense core; below that a 300 m chord never reaches the several optical
+         depths that make a cloud read as an opaque lit SOLID rather than as
+         fog with an albedo clamp. */
+      uSigma:    { value: 0.090 },
       uBase:     { value: CL_BASE },
       uTop:      { value: CL_TOP },
-      uPowder:   { value: 0.85 },
+      uPowder:   { value: 0.62 },
       uAmb:      { value: 1.0 },
       uScale:    { value: 1.0 },
       uMaxD:     { value: 130.0 },
@@ -1053,16 +1657,126 @@
          a photometer reads on a trade-wind day.  Push it past that and the
          auto-exposure crushes the blue out of the sky to compensate; leave it
          short and the tops never reach white. */
-      uDirect:   { value: 18.0 },
-      uErode:    { value: 0.82 },
-      uFade:     { value: 1.55 }
+      /* Retuned again for the 3-octave Wrenninge ladder (a *= 0.46, sum 1.67)
+         and the much smaller ambient pedestal.  The target, verified by pixel
+         probe against the ACES curve baked into post.js, is a sunlit crown at
+         ~60 scene-referred units (sRGB 244) over a shaded base at ~8 (sRGB
+         ~135) — 2.9 stops, which is what the reference demands. */
+      /* 15.5 -> 56.  Measured, not guessed: the visible surface of a dense
+         cumulus is already 4-6 optical depths from the sun (sigma*d = 0.072/m,
+         so the VIEW ray also terminates ~30 m in and every shaded sample is a
+         near-surface sample), and at 15.5 that put a fully sunlit crown at 11
+         scene units — sRGB 194, nowhere near the top of the range, with the
+         whole cloud population compressed into 0.5 stops.  56 puts a sunlit
+         crown at ~2.0 on the ACES curve (sRGB 238-245) and leaves the shaded
+         base, which is exp(-dl) suppressed and therefore does NOT scale with
+         this, sitting 2.2-2.6 stops below it. */
+      uDirect:   { value: 56.0 },
+      /* Erosion is CLAMPED against the local density now (it can only bite the
+         translucent flanks), so it can be pushed harder without hollowing the
+         cores or punching the torus holes the review found. */
+      uErode:    { value: 1.22 },
+      /* Analytic sun-column extrapolation (see clLight): uSunPath is the
+         nominal core density it assumes, uSunGate the optical depth of nearby
+         cloud needed before it fires at full strength. */
+      uSunPath:  { value: 0.42 },
+      uSunGate:  { value: 120.0 },
+      uFade:     { value: 1.70 },
+      uDebug:    { value: 0.0 }
     };
   }
+
+  /* ---------------------------------------------- cloud shadow plane pass */
+  /* 256^2 over 9000 m is 35 m per texel — four texels across a whole cumulus
+     shadow, which is why nothing downstream could make a recognisable patch out
+     of it and reached for its own noise field instead.  1024^2 is 8.8 m/texel;
+     with the linear filter that is a soft-edged patch of the right SHAPE, and
+     it is the same field the dome is drawing, so a cloud and its shadow finally
+     agree.  Rendered one 1024x86 band per frame (88 k px, cheaper than the old
+     full 256^2 every third frame was per-frame-equivalent x2) with the box
+     origin re-snapped only at band 0 so the bands stay mutually consistent. */
+  var SH_RES = 1024, SH_SPAN = 9000, SH_BANDS = 12, shBand = 0;
+  var _shOrigin = new THREE.Vector2(0, 0);
+  var _shPend = new THREE.Vector2(0, 0);
+
+  function buildCloudShadow() {
+    if (rtShadow) { rtShadow.dispose(); rtShadow = null; }
+    if (matShadow) { matShadow.dispose(); matShadow = null; }
+    rtShadow = new THREE.WebGLRenderTarget(SH_RES, SH_RES, {
+      type: THREE.UnsignedByteType, format: THREE.RGBAFormat,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      wrapS: THREE.ClampToEdgeWrapping, wrapT: THREE.ClampToEdgeWrapping,
+      depthBuffer: false, stencilBuffer: false, generateMipmaps: false
+    });
+    rtShadow.texture.colorSpace = THREE.LinearSRGBColorSpace;
+    var u = cloudUniforms(SH_RES, SH_RES);
+    u.uShOrigin = { value: new THREE.Vector2(0, 0) };
+    u.uShSpan = { value: SH_SPAN };
+    matShadow = post(new THREE.ShaderMaterial({
+      defines: { CL_SHSTEPS: 16, CL_LIGHT: 1, CL_STEPS: 1, CL_TARGET: 1 },
+      uniforms: u,
+      vertexShader: QUAD_VS,
+      fragmentShader: 'precision highp float;\n' + GLSL + '\n' + CLOUD_FIELD + '\n' + CLOUD_SHMAP
+    }));
+    S.register(matShadow);
+    U.uSkyCloudShTex.value = rtShadow.texture;
+  }
+
+  function renderCloudShadow(all) {
+    if (!matShadow || !rtShadow || !matCloud) return;
+    if (all) {
+      shBand = 0;
+      for (var n = 0; n < SH_BANDS; n++) renderCloudShadow(false);
+      shBand = 0; return;
+    }
+    var a = matCloud.uniforms, b = matShadow.uniforms;
+    b.uWeather.value = a.uWeather.value;
+    b.uShapeVol.value = a.uShapeVol.value;
+    b.uDetVol.value = a.uDetVol.value;
+    b.uLand.value = a.uLand.value;
+    b.uT.value = a.uT.value;
+    b.uSigma.value = a.uSigma.value;
+    b.uBase.value = a.uBase.value;
+    b.uTop.value = a.uTop.value;
+    b.uErode.value = a.uErode.value;
+    b.uWind.value.copy(a.uWind.value);
+    b.uShear.value.copy(a.uShear.value);
+    b.uCover.value.copy(a.uCover.value);
+    b.uLightDir.value.copy(a.uLightDir.value);
+    /* snap the box to the texel grid so the shadow field does not crawl as
+       the boat moves — the same discipline the sun cascade needs.  The origin
+       is only allowed to move at band 0, so every band of one sweep shares one
+       projection and the map never tears along a band boundary. */
+    if (shBand === 0) {
+      var cam = SAIL.camera ? SAIL.camera.position : null;
+      var cx = cam ? cam.x : 0, cz = cam ? cam.z : 0;
+      var tx = SH_SPAN / SH_RES;
+      _shPend.set(Math.floor((cx - SH_SPAN * 0.5) / tx) * tx,
+                  Math.floor((cz - SH_SPAN * 0.5) / tx) * tx);
+    }
+    b.uShOrigin.value.copy(_shPend);
+    _shOrigin.copy(_shPend);
+    var bh = Math.ceil(SH_RES / SH_BANDS);
+    var y0 = shBand * bh, hh = Math.min(bh, SH_RES - y0);
+    if (hh > 0) blit(matShadow, rtShadow, [0, y0, SH_RES, hh]);
+    shBand = (shBand + 1) % SH_BANDS;
+    U.uSkyCloudShTex.value = rtShadow.texture;
+    U.uSkyCloudShBox.value.set(_shOrigin.x, _shOrigin.y, 1 / SH_SPAN, S.cloudShadowStrength);
+  }
+
+  /* Public handle for the shadow pass / any consumer. */
+  S.cloudShadowStrength = 0.85;
+  S.cloudShadow = function () {
+    return { map: rtShadow ? rtShadow.texture : null,
+             originX: _shOrigin.x, originZ: _shOrigin.y,
+             span: SH_SPAN, strength: S.cloudShadowStrength,
+             glsl: 'sailCloudShadow(vec3 worldPos)' };
+  };
 
   /* -------------------------------------------------------- panoramic LUT */
   var cloudBand = 0, CLOUD_BANDS = 5;
 
-  function buildCloudLUT(w, h, steps, target) {
+  function buildCloudLUT(w, h, steps, target, lightSteps) {
     if (rtCloud) { rtCloud.dispose(); rtCloud = null; }
     if (matCloud) { matCloud.dispose(); matCloud = null; }
     rtCloud = new THREE.WebGLRenderTarget(w, h, {
@@ -1073,7 +1787,7 @@
     });
     rtCloud.texture.colorSpace = THREE.LinearSRGBColorSpace;
     matCloud = post(new THREE.ShaderMaterial({
-      defines: { CL_PANO: 1, CL_STEPS: steps, CL_TARGET: target, CL_LIGHT: 5 },
+      defines: { CL_PANO: 1, CL_STEPS: steps, CL_TARGET: target, CL_LIGHT: lightSteps || 5 },
       uniforms: cloudUniforms(w, h),
       vertexShader: QUAD_VS,
       fragmentShader: 'precision highp float;\n' + GLSL + '\n' + CLOUD_FIELD + '\n' + CLOUD_MARCH
@@ -1098,7 +1812,7 @@
   }
 
   /* --------------------------------------------------- screen-space march */
-  S.cloudScale = 0.48;                 // screen-space march resolution factor
+  S.cloudScale = 0.68;                 // screen-space march resolution factor
   var rtScr = [null, null], scrFlip = 0, matScr = null;
   var scrW = 0, scrH = 0, scrFrame = 0, scrValid = false;
   var scrBasis = { r: new THREE.Vector3(1, 0, 0), u: new THREE.Vector3(0, 1, 0),
@@ -1108,7 +1822,7 @@
                     f: new THREE.Vector3(0, 0, -1), tan: new THREE.Vector2(1, 1) };
   var _bm = new THREE.Matrix4(), _dbs = new THREE.Vector2();
 
-  function buildScreenCloud(steps, target) {
+  function buildScreenCloud(steps, target, lightSteps) {
     if (matScr) { matScr.dispose(); matScr = null; }
     var u = cloudUniforms(2, 2);
     u.uFwd = { value: new THREE.Vector3(0, 0, -1) };
@@ -1123,7 +1837,7 @@
     u.uHistOn = { value: 0 };
     u.uFrame = { value: 0 };
     matScr = post(new THREE.ShaderMaterial({
-      defines: { CL_STEPS: steps, CL_TARGET: target, CL_LIGHT: 5 },
+      defines: { CL_STEPS: steps, CL_TARGET: target, CL_LIGHT: lightSteps || 5 },
       uniforms: u,
       vertexShader: QUAD_VS,
       fragmentShader: 'precision highp float;\n' + GLSL + '\n' + CLOUD_FIELD + '\n' + CLOUD_MARCH
@@ -1160,7 +1874,9 @@
   function syncScreenUniforms() {
     if (!matScr || !matCloud) return;
     var a = matCloud.uniforms, b = matScr.uniforms;
-    b.uNoise.value = a.uNoise.value;
+    b.uWeather.value = a.uWeather.value;
+    b.uShapeVol.value = a.uShapeVol.value;
+    b.uDetVol.value = a.uDetVol.value;
     b.uLand.value = a.uLand.value;
     b.uT.value = a.uT.value;
     b.uScale.value = a.uScale.value;
@@ -1170,7 +1886,10 @@
     b.uMaxD.value = a.uMaxD.value;
     b.uDirect.value = a.uDirect.value;
     b.uErode.value = a.uErode.value;
+    b.uSunPath.value = a.uSunPath.value;
+    b.uSunGate.value = a.uSunGate.value;
     b.uFade.value = a.uFade.value;
+    b.uDebug.value = a.uDebug.value;
     b.uBase.value = a.uBase.value;
     b.uTop.value = a.uTop.value;
     b.uWind.value.copy(a.uWind.value);
@@ -1223,6 +1942,7 @@
       var du = domeMat.uniforms;
       du.uScrCloud.value = dst.texture;
       du.uScrOn.value = 1;
+      du.uScrSize.value.set(scrW, scrH);
       du.uSFwd.value.copy(scrBasis.f); du.uSRight.value.copy(scrBasis.r);
       du.uSUp.value.copy(scrBasis.u); du.uSTan.value.copy(scrBasis.tan);
     }
@@ -1233,6 +1953,7 @@
     var du = S.getUniforms();
     du.uScrCloud = { value: null };
     du.uScrOn = { value: 0 };
+    du.uScrSize = { value: new THREE.Vector2(768, 480) };
     du.uSFwd = { value: new THREE.Vector3(0, 0, -1) };
     du.uSRight = { value: new THREE.Vector3(1, 0, 0) };
     du.uSUp = { value: new THREE.Vector3(0, 1, 0) };
@@ -1248,9 +1969,37 @@
         '  gl_Position = vClip; }'
       ].join('\n'),
       fragmentShader: 'precision highp float;\n' + GLSL + '\n' + [
-        'uniform sampler2D uScrCloud; uniform float uScrOn;',
+        'uniform sampler2D uScrCloud; uniform float uScrOn; uniform vec2 uScrSize;',
         'uniform vec3 uSFwd, uSRight, uSUp; uniform vec2 uSTan;',
         'varying vec3 vDir; varying vec4 vClip;',
+        '/* Alpha-aware upsample.  The cloud buffer is half resolution and now',
+        '   carries a deliberate per-step ray jitter; a plain bilinear tap',
+        '   smears that jitter into the feathered comb the review flagged, and',
+        '   a plain blur would feather the silhouette instead.  So: five taps,',
+        '   each weighted by how close its coverage and radiance are to the',
+        '   centre tap.  Inside a cloud and inside clear sky this averages the',
+        '   jitter away; across a silhouette the weights collapse to the centre',
+        '   tap and the edge stays exactly as sharp as the march made it.    */',
+        'vec4 clUpsample(vec2 uv){',
+        '  vec2 ts = 1.0/uScrSize;',
+        '  vec4 c = texture2D(uScrCloud, uv);',
+        '  float lc = dot(c.rgb, vec3(0.3333));',
+        '  vec4 acc = c*1.4; float wsum = 1.4;',
+        '  for (int i=0;i<8;i++){',
+        '    vec2 o;',
+        '    if (i==0)      o = vec2( ts.x, 0.0);',
+        '    else if (i==1) o = vec2(-ts.x, 0.0);',
+        '    else if (i==2) o = vec2( 0.0,  ts.y);',
+        '    else if (i==3) o = vec2( 0.0, -ts.y);',
+        '    else if (i==4) o = vec2( ts.x,  ts.y)*0.87;',
+        '    else if (i==5) o = vec2(-ts.x,  ts.y)*0.87;',
+        '    else if (i==6) o = vec2( ts.x, -ts.y)*0.87;',
+        '    else           o = vec2(-ts.x, -ts.y)*0.87;',
+        '    vec4 s = texture2D(uScrCloud, uv+o);',
+        '    float w = exp(-2.4*abs(s.a-c.a) - 1.6*abs(dot(s.rgb,vec3(0.3333))-lc)/(1.0+lc));',
+        '    w *= (i<4) ? 1.0 : 0.62;',
+        '    acc += s*w; wsum += w; }',
+        '  return acc/wsum; }',
         'void main(){',
         '  vec3 d = normalize(vDir);',
         '  vec3 c = skyRadianceBase(d, uSkySunDir) + sailNightSky(d)',
@@ -1267,7 +2016,7 @@
         '      vec2 nd = uv*2.0 - 1.0;',
         '      vec3 rd = normalize(uSFwd + uSRight*(nd.x*uSTan.x) + uSUp*(nd.y*uSTan.y));',
         '      if (dot(rd, d) > 0.9997){',
-        '        vec4 s = texture2D(uScrCloud, uv);',
+        '        vec4 s = clUpsample(uv);',
         '        float f = uSkyCloudMix;',
         '        cl = vec4(s.rgb*uSkyLutScale*f, mix(1.0, clamp(s.a, 0.0, 1.0), f));',
         '        ok = true; } } }',
@@ -1373,7 +2122,7 @@
     var dip = Math.acos(Math.min(RG / (RG + h), 1)) / DEG;
     var m = Math.min(airmass(altDeg + dip), 80);
     var fR = Math.exp(-h / 8.0);
-    var fA = (1.2 * Math.exp(-h / 1.2) + 2.925 * Math.exp(-h / 0.45)) / 4.125;
+    var fA = (1.2 * Math.exp(-h / 1.2) + 2.952 * Math.exp(-h / 0.36)) / 4.152;
     var fO = ozoneAbove(h);
     for (var i = 0; i < 3; i++) out[i] = Math.exp(-m * (TAU_R[i] * fR + TAU_A[i] * fA + TAU_O[i] * fO));
     return out;
@@ -1408,7 +2157,7 @@
       var shdM = smoothstepf(ch - 0.075, ch + 0.075, muS + 0.0026);
       var altS = Math.asin(clamp(muS, -1, 1)) / DEG;
       beamTransmittanceAt(h, altS, _tmpT);
-      var dR = Math.exp(-h / 8), dM = Math.exp(-h / 1.2) + 6.5 * Math.exp(-h / 0.45);
+      var dR = Math.exp(-h / 8), dM = Math.exp(-h / 1.2) + 8.2 * Math.exp(-h / 0.36);
       var dO = Math.max(0, 1 - Math.abs(h - 25) / 15);
       for (var c = 0; c < 3; c++) {
         var sR = BETA_R[c] * dR, sM = BETA_M * dM;
@@ -1416,10 +2165,11 @@
         var tl = _tmpT[c];
         var inS = (sR * pr + sM * pm) * tl * shd;
         // must mirror the GPU LUT's multiple-scattering term exactly
-        var msPh = 0.72 + 0.28 * (pr * 4 * PI / 3);
-        var iso = (sR + sM * 0.04) * (0.25 / PI) * Math.pow(Math.max(tl, 1e-5), 0.44) * shdM * msPh;
+        var msFwd = clamp(hgF(nu, 0.55) * 4 * PI, 0, 24);
+        var msPh = Math.max(0.70 + 0.16 * (pr * 4 * PI / 3) + 0.145 * (msFwd - 1), 0.30);
+        var iso = (sR + sM * 0.015) * (0.25 / PI) * Math.pow(Math.max(tl, 1e-5), 0.22) * shdM * msPh;
         var st = Math.exp(-ext * dt);
-        L[c] += T[c] * ((inS + iso * 0.92) * (1 - st) / ext);
+        L[c] += T[c] * ((inS + iso * 0.74) * (1 - st) / ext);
         T[c] *= st;
       }
     }
@@ -1545,25 +2295,46 @@
     built = true; S.ready = true;
     S.update(0, 0.016);
     renderCloudBand(true);
+    renderCloudShadow(true);      // all bands, or the world starts in shadow
     updateEnv(1e9);
+    try { S.selfTest(); } catch (e) {}
     return S;
   };
 
   function allocForQuality() {
     quality = (SAIL.quality === 'low') ? 'low' : 'high';
+    /* CL_TARGET is now a FINE-step budget, not a total-step budget: the march
+       probes empty space at 3.2x this and only spends steps where there is
+       cloud, so a much denser nominal sampling costs about what the old fixed
+       march did.  CL_STEPS is the hard iteration cap. */
+    /* PANORAMA RESOLUTION IS NOT A QUALITY DIAL, IT IS A CORRECTNESS ONE.
+       768x384 is 0.469 deg per texel.  At the scene's ~92 deg horizontal field
+       across 1800 px (19.5 px/deg) one texel covers 9.2 screen pixels, so every
+       cloud the panorama serves — reflections, PMREM, aerial perspective, and
+       any dome fragment the screen march declines — arrives as 8-16 px blocks
+       with no silhouette left in it.  2048x1024 is 0.176 deg/texel = 3.4 screen
+       px, which the Catmull-Rom tap in sailCloudSample then reconstructs into
+       something continuous.  The cost is paid back by banding harder: 16 bands
+       renders 2048x64 per frame (131 k px, about a quarter of the screen
+       march) and refreshes the whole dome every 16 frames, which is 0.27 s for
+       a field that moves 2 m in that time. */
     if (quality === 'low') {
-      CLOUD_BANDS = 6;
-      S.cloudScale = 0.36;
+      CLOUD_BANDS = 12;
+      S.cloudScale = 0.50;
       buildSkyLUT(192, 96, 24);
-      buildCloudLUT(384, 192, 48, 30);
-      buildScreenCloud(64, 44);
+      buildCloudLUT(1024, 512, 56, 80, 4);
+      buildScreenCloud(70, 92, 4);
     } else {
-      CLOUD_BANDS = 8;
-      S.cloudScale = 0.48;
+      CLOUD_BANDS = 16;
+      /* 0.56 -> 0.68.  0.56 backs a 1600 px frame with an 896 px buffer: 1.8
+         screen px per marched sample, which the bilateral upsample can only
+         feather, and the residual is the 2 px lattice that survived TAA. */
+      S.cloudScale = 0.68;
       buildSkyLUT(384, 192, 34);
-      buildCloudLUT(768, 384, 88, 46);
-      buildScreenCloud(116, 70);
+      buildCloudLUT(2048, 1024, 72, 96, 6);
+      buildScreenCloud(88, 116, 6);
     }
+    buildCloudShadow();
     if (domeMat) { for (var k in U) domeMat.uniforms[k] = U[k]; domeMat.needsUpdate = true; }
     skyDirty = true; envDirty = true;
   }
@@ -1574,6 +2345,7 @@
     if (want === quality) { skyDirty = true; envDirty = true; return; }
     allocForQuality();
     renderCloudBand(true);
+    renderCloudShadow(true);
   };
 
   /* ====================================================================== */
@@ -1732,10 +2504,24 @@
     if (useMoon) cu.uLightCol.value.set(moonE * 0.26, moonE * 0.31, moonE * 0.42);
     else cu.uLightCol.value.set(sunE * sunColor.r, sunE * sunColor.g, sunE * sunColor.b);
     var cs = clamp(cloud, 0, 1);
-    cu.uCover.value.set(0.05 + 0.85 * cs, 0.07);      // x = coverage, y = land bias
+    /* Coverage.  The review measured 63.9% of the sky band filled — a wall.
+       Trade-wind cumulus is 15-30% plan cover, and because the weather map is
+       now a Worley CELL field rather than an fbm plateau, this number maps
+       almost directly onto apparent cover instead of being amplified by lobe
+       merging.  Default env cloudCover 0.35 -> 0.335 here. */
+    cu.uCover.value.set(0.10 + 0.67 * cs, 0.085);     // x = coverage, y = orographic bias
     cu.uAmb.value = 1.0;
     renderCloudBand(false);
     renderScreenCloud();
+
+    /* Cloud shadow plane: amortised over 3 frames, and only worth anything
+       while the sun is actually up.  The strength ramps with elevation so it
+       does not pop on at dawn. */
+    /* Trade-wind cumulus shadows on open water take 45-60% off the direct
+       component, not 40.  0.90 -> 0.96 on the ceiling; consumers see the full
+       range through sailCloudShadow(). */
+    S.cloudShadowStrength = 0.96 * smoothstepf(0.02, 0.20, sunDir.y) * (0.35 + 0.65 * cs);
+    renderCloudShadow(false);
 
     /* ---- dome follows the camera, sized inside the frustum ---- */
     if (dome) {
@@ -1775,7 +2561,7 @@
       if (Math.abs(dy) < 0.75) return dist * a * Math.exp(-0.5 * dy / H);
       return dist * H * (a - Math.exp(-Math.max(y1, 0) / H)) / dy;
     }
-    var odR = pd(8000), odM = pd(1200) + 6.5 * pd(450);
+    var odR = pd(8000), odM = pd(1200) + 8.2 * pd(360);
     var bm = U.uSkyBetaMe.value;
     return [Math.exp(-(BETA_R[0] * 1e-3 * odR + bm * odM)),
             Math.exp(-(BETA_R[1] * 1e-3 * odR + bm * odM)),
@@ -1786,9 +2572,76 @@
     return cpuSky(dx / l, dy / l, dz / l, o);
   };
 
+  /* ====================================================================== */
+  /*  SELF TEST — cumulus crown-over-base ratio                              */
+  /*  This subsystem has silently INVERTED twice: a build shipped with the   */
+  /*  underside measurably brighter and warmer than the sun-facing crown,    */
+  /*  which is not a near miss but a sign error, and it is invisible in a    */
+  /*  thumbnail — a flat white cutout and a properly lit cell look identical */
+  /*  until you put a probe on them.  So the shading ladder is mirrored here */
+  /*  for a nominal 1400 m trade cumulus and the ratio is asserted on build. */
+  /*  Anything that touches uDirect, uSigma, uSunPath, the Wrenninge octave  */
+  /*  constants or the aUp/aDn split has to keep this above CROWN_BASE_MIN.  */
+  /* ====================================================================== */
+  var CROWN_BASE_MIN = 1.8;          // stops, scene-referred
+
+  function cloudLadder(dl, nu) {     // must mirror clShade() exactly
+    var lum = 0, a = 1, b = 1, c = 1;
+    for (var o = 0; o < 3; o++) {
+      var ph = 0.83 * hgF(nu, 0.78 * c) + 0.17 * hgF(nu, -0.30 * c);
+      lum += a * Math.exp(-dl * b) * ph;
+      a *= 0.40; b *= 0.34; c *= 0.58;
+    }
+    return lum;
+  }
+
+  /* Radiance of a cumulus sample at height fraction hh inside a cell of the
+     given thickness.  exposed = the sample sits on the lit outer shell (the
+     view ray only penetrates ~1/(sigma*d) metres, so every shaded sample the
+     camera can see is a near-surface sample); buried = it is under the column. */
+  function cloudProbe(hh, thick, exposed) {
+    var cu = matCloud ? matCloud.uniforms : cloudUniformDefaults();
+    var sigma = cu.uSigma.value, d = 0.85;
+    var sunY = Math.max(Math.abs(sunDir.y), 1e-3);
+    /* stochastic march contribution: a lit shell clears the cloud in tens of
+       metres, a buried sample stays inside it for most of the 2.4 km reach */
+    var tau = exposed ? d * 70 : d * 900;
+    var near = exposed ? d * 24 : d * 247;
+    var buried = clamp(near / cu.uSunGate.value, 0, 1);
+    var above = clamp(1 - hh, 0, 1) * thick;
+    var ly = Math.max(Math.abs(sunY), 0.26);
+    var pathA = above / ly; pathA = pathA / (1 + pathA * 0.0012);
+    var dl = (tau + buried * pathA * cu.uSunPath.value) * sigma;
+    var direct = U.uSkySunE.value * cu.uDirect.value * cloudLadder(dl, 0.0);
+    var vis = clamp(hh, 0, 1); vis = vis * vis * (3 - 2 * vis); vis *= vis;
+    var ambE = Math.max(U.uSkySkyE.value, 0);
+    var aUp = ambE * 0.82, aDn = ambE * 0.36 + ambE * 0.018 + U.uSkySunE.value * 0.0030;
+    var occ = exposed ? 0.92 : 0.45;
+    return direct + (aDn + (aUp - aDn) * vis) * occ * cu.uAmb.value;
+  }
+  function cloudUniformDefaults() {
+    return { uSigma: { value: 0.090 }, uDirect: { value: 56.0 }, uAmb: { value: 1.0 },
+             uSunPath: { value: 0.42 }, uSunGate: { value: 120.0 } };
+  }
+
+  S.selfTest = function (quiet) {
+    var thick = 1400;
+    var crown = cloudProbe(0.97, thick, true);
+    var base  = cloudProbe(0.04, thick, false);
+    var stops = Math.log(crown / Math.max(base, 1e-6)) / Math.LN2;
+    var ok = stops >= CROWN_BASE_MIN && crown > base;
+    var msg = '[SAIL.sky] cumulus crown ' + crown.toFixed(1) + ' vs base ' + base.toFixed(1) +
+              ' = ' + stops.toFixed(2) + ' stops (min ' + CROWN_BASE_MIN.toFixed(1) + ')';
+    if (window.console && !quiet) {
+      if (ok) console.log(msg + ' OK');
+      else console.error(msg + ' FAIL — cumulus lighting is flat or inverted');
+    }
+    return { ok: ok, stops: stops, crown: crown, base: base };
+  };
+
   S.dispose = function () {
-    [rtTrans, rtSky, rtCloud, rtNoise, envRT, rtScr[0], rtScr[1]].forEach(function (r) { if (r) r.dispose(); });
-    [matTrans, matSky, matCloud, matNoise, matScr, domeMat].forEach(function (m) { if (m) m.dispose(); });
+    [rtTrans, rtSky, rtCloud, rtNoise, rtShape, rtDet, rtShadow, envRT, rtScr[0], rtScr[1]].forEach(function (r) { if (r) r.dispose(); });
+    [matTrans, matSky, matCloud, matNoise, matScr, matShadow, domeMat].forEach(function (m) { if (m) m.dispose(); });
     rtScr[0] = rtScr[1] = null; scrValid = false;
     if (landTex) landTex.dispose();
     if (pmrem) pmrem.dispose();
