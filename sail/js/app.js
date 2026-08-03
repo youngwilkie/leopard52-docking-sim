@@ -614,6 +614,17 @@
     var lateRatio = gov.late / gov.filled;
     if (SAIL.quality === 'low') { gov.cool = 2.5; govReset(); return; }
 
+    /* Fast bail-out. Walking the render scale down 0.10 at a time with a 2.5 s
+       cooldown takes ~7 s to get from 'high' to 'low', and at 45-50 ms/frame
+       every one of those seconds is a juddering mess that reads as the whole
+       picture shaking. If we are more than about 3x over budget, the scale is
+       not the problem and no amount of it will help — drop profile now. */
+    if (ms > 22 && SAIL.quality !== 'low') {
+      setQuality('low');
+      notify('GRAPHICS: LOW', 2.0);
+      gov.cool = 4.0; gov.up = 0; govReset();
+      return;
+    }
     if (ms > GOV_DOWN || lateRatio > 0.25) {
       if (gov.scale > RSMIN + 1e-3) {
         setRenderScale(gov.scale - (ms > GOV_GIVEUP + 4 ? 0.20 : 0.10));
@@ -814,6 +825,15 @@
       case '4': setCam('orbit'); break;
       case '5': setCam('masthead'); break;
       case 'x': ctl.rudder = 0; break;
+      case 'k': case '?': case '/':
+        document.body.classList.toggle('showhelp');
+        e.preventDefault();
+        break;
+      case 'escape':
+        if (document.body.classList.contains('showhelp')) {
+          document.body.classList.remove('showhelp'); e.preventDefault();
+        }
+        break;
       case 'p':
         ctl.sailsUp = !ctl.sailsUp;
         if (boat) boat.setSails(ctl.sailsUp);

@@ -593,8 +593,12 @@
 
     chroma: 0.0016,
     vignette: 0.26,
-    grain: 0.013,
-    dither: 1.0,
+    // Grain and dither are reseeded every draw. At 60 fps that reads as film
+    // texture; at 20-30 fps it reads as the picture crawling, which is a large
+    // part of what looks like "shake". Keep both low enough to survive a bad
+    // frame rate.
+    grain: 0.007,
+    dither: 0.5,
 
     godrays: true,
     godrayStrength: 0.30,

@@ -147,6 +147,59 @@
 
 <div id="err"></div>
 
+<div id="helphint">Press <b>K</b> for controls</div>
+<div id="help"><div class="hcard">
+  <h3>Controls</h3>
+  <div class="hgrid">
+    <div class="hsec">Steering &amp; engines</div>
+    <div><b>W</b> / <b>S</b><span>throttle ahead / astern (both engines)</span></div>
+    <div><b>A</b> / <b>D</b><span>helm to port / starboard</span></div>
+    <div><b>Space</b><span>throttle back to neutral</span></div>
+    <div><b>X</b><span>centre the helm</span></div>
+    <div class="hsec">Sails</div>
+    <div><b>P</b><span>hoist / stow the sails</span></div>
+    <div><b>[</b> / <b>]</b><span>mainsheet in / out</span></div>
+    <div><b>;</b> / <b>'</b><span>jib sheet in / out</span></div>
+    <div><b>T</b><span>auto-trim on / off</span></div>
+    <div><b>R</b><span>reef</span></div>
+    <div class="hsec">View &amp; world</div>
+    <div><b>1</b>–<b>5</b><span>helm · cockpit · chase · orbit · masthead</span></div>
+    <div><b>drag</b><span>look around</span></div>
+    <div><b>Q</b> / <b>E</b><span>snap view ahead / to windward</span></div>
+    <div><b>,</b> / <b>.</b><span>time of day</span></div>
+    <div><b>C</b><span>more wind (shift for less)</span></div>
+    <div><b>N</b> / <b>L</b><span>nav lights / deck light</span></div>
+    <div><b>H</b> / <b>M</b><span>hide HUD / mute</span></div>
+  </div>
+  <div class="hfoot">Press <b>K</b> or <b>Esc</b> to close</div>
+</div></div>
+
+<style>
+#helphint{position:fixed;left:12px;bottom:10px;z-index:40;font:600 11px ui-monospace,Menlo,monospace;
+  letter-spacing:.04em;color:rgba(220,235,245,.55);background:rgba(6,16,24,.5);
+  border:1px solid rgba(150,200,225,.18);border-radius:7px;padding:5px 9px;pointer-events:none;
+  transition:opacity .4s}
+#helphint b{color:#7fd4ff}
+body.showhelp #helphint{opacity:0}
+#help{position:fixed;inset:0;z-index:41;display:none;align-items:center;justify-content:center;
+  background:rgba(3,10,16,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:18px}
+body.showhelp #help{display:flex}
+#help .hcard{max-width:620px;width:100%;max-height:92vh;overflow-y:auto;
+  background:rgba(9,20,29,.94);border:1px solid rgba(150,200,225,.25);border-radius:14px;padding:20px 22px;
+  box-shadow:0 18px 60px rgba(0,0,0,.55);color:#e8f1f5;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+#help h3{margin:0 0 12px;font-size:17px;letter-spacing:.01em}
+#help .hgrid{display:grid;grid-template-columns:1fr;gap:5px}
+#help .hsec{margin:11px 0 3px;font:700 9.5px ui-monospace,Menlo,monospace;letter-spacing:.14em;
+  text-transform:uppercase;color:#7fd4ff}
+#help .hgrid>div:not(.hsec){display:flex;align-items:baseline;gap:10px;font-size:12.5px;
+  padding:3px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+#help .hgrid>div>b{flex:0 0 92px;font:700 11.5px ui-monospace,Menlo,monospace;color:#cfe8f5}
+#help .hgrid>div>span{color:#9fb3bd}
+#help .hfoot{margin-top:14px;font-size:11.5px;color:#7f95a1;text-align:center}
+@media(max-width:560px){#help .hgrid>div>b{flex:0 0 74px} #help .hcard{padding:15px}}
+</style>
+
 <script src="vendor/three.min.js"></script>
 <script>
 /* The static host sends Last-Modified and nothing else, so Chrome applies
